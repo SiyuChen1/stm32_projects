@@ -1,0 +1,81 @@
+# =============================================================================
+# .gitignore for /home/siyuchen/STM32
+# STM32CubeIDE workspaces (workspace_1.13.2, workspace_2.2.0) + vendored ST
+# packages (X-CUBE-53L9A1, STM32CubeH5)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# resource/STM32CubeH5 is already its own git repository
+# (github.com/STMicroelectronics/STM32CubeH5, ~1.2GB, has its own remote).
+# Don't let this repo try to track its contents. If you actually want it
+# linked from here, add it as a proper submodule instead of relying on this
+# rule: `git submodule add https://github.com/STMicroelectronics/STM32CubeH5.git resource/STM32CubeH5`
+# -----------------------------------------------------------------------------
+resource/STM32CubeH5/
+
+# -----------------------------------------------------------------------------
+# STM32CubeIDE / Eclipse CDT build output directories.
+#
+# Deliberately NOT blanket-ignoring *.bin/*.hex/*.elf/*.a/*.s by extension -
+# this tree has legitimate vendor-shipped files with those same extensions
+# living outside build folders (the official prebuilt reference image at
+# .../53L9A1_PostprocessSingle/Binary/*.bin, RoT-provisioning .bin/.hex test
+# data, startup_*.s assembly sources, prebuilt middleware .a libraries).
+# Ignoring the whole build-output directory instead is precise and avoids
+# accidentally excluding any of those.
+# -----------------------------------------------------------------------------
+Debug/
+Release/
+
+# Generated object/build-report files with extensions that are unambiguously
+# always generated (never legitimate hand-authored or vendor-shipped source
+# in this tree) - a safety net for anything that ever lands outside
+# Debug/Release.
+*.o
+*.obj
+*.su
+*.cyclo
+*.map
+*.list
+*.d
+
+# -----------------------------------------------------------------------------
+# Eclipse / STM32CubeIDE workspace metadata - machine-specific, regenerated,
+# large (e.g. workspace_1.13.2/.metadata, workspace_2.2.0/.metadata).
+# -----------------------------------------------------------------------------
+.metadata/
+.recommenders/
+RemoteSystemsTempFiles/
+
+# Per-project IDE indexer/discovery settings cache - often contains
+# machine-specific absolute paths, regenerated automatically when a project
+# is reopened. Comment this out if you'd rather keep it tracked for
+# project-setup consistency across machines.
+.settings/
+
+# -----------------------------------------------------------------------------
+# Python (Utilities/vl53l9_visualizer.py and any future PC-side tooling)
+# -----------------------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# -----------------------------------------------------------------------------
+# Session backup files left behind from firmware A/B debugging (e.g.
+# Src/*.with-visualizer.bak under X-CUBE-53L9A1) - harmless clutter, not
+# meant to be committed. Delete them or leave them; either way they won't
+# get picked up.
+# -----------------------------------------------------------------------------
+*.bak
+*.orig
+
+# -----------------------------------------------------------------------------
+# OS / editor cruft
+# -----------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
