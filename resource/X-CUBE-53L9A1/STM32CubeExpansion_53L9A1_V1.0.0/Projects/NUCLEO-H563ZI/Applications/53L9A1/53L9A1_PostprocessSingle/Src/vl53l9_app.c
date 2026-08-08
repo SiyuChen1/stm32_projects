@@ -29,6 +29,9 @@
 
 /* USER CODE BEGIN Includes */
 #include "stm32h5xx_nucleo.h" /* hcom_uart[], COM1, HAL_UART_Transmit - used to stream binary frames to the PC */
+#include "main.h" /* SPI4_NSS_Pin/XIAO_READY_Pin etc. - used to stream binary frames to a XIAO over SPI4 */
+
+extern SPI_HandleTypeDef hspi4; /* defined in main.c, initialized by MX_SPI4_Init() */
 /* USER CODE END Includes */
 
 /* application customization */
@@ -38,10 +41,24 @@
 
 /**
  * @brief Enable streaming amplitude+depth frames to the PC as a binary packet over the COM1 UART.
- * Pair with Utilities/vl53l9_visualizer.py on the host. Requires BspCOMInit.BaudRate in main.c
+ * Pair with Utilities/vl53l9_visualizer.py on the host.
+ *
+ * TURNED OFF for throughput. Measured cost: 83ms of a 210ms frame (40%) - 22692 bytes at 3Mbaud is
+ * 75.6ms of pure line time plus per-call overhead, and it is a blocking transmit, so it is pure
+ * added latency on every frame. The XIAO/WiFi path now carries the same data. Set back to 1 if you
+ * need the tethered PC visualizer again, accepting ~5fps. Requires BspCOMInit.BaudRate in main.c
  * to be raised (see comment there) since 115200 bps is far too slow for image-sized payloads.
  */
-#define CONF_STREAM_VISUALIZER (1)
+#define CONF_STREAM_VISUALIZER (0)
+
+/**
+ * @brief Enable bridging the same amplitude+depth+ambient frame to a XIAO ESP32 over SPI4 (SCK=PE12,
+ * MISO=PE13, MOSI=PE14, software NSS=PE11, XIAO_READY handshake input=PE9), for the XIAO to re-serve
+ * as a live webpage over WiFi instead of requiring a PC tethered to the STM32's UART. Independent of
+ * CONF_STREAM_VISUALIZER - either or both can be on. See stm32_utility/spi/spi.ino in the separate
+ * Arduino repo for the receiving side and the full wire/handshake protocol writeup.
+ */
+#define CONF_STREAM_SPI (1)
 
 /**
  * @brief Max consecutive retries for one frame's trigger/wait/read sequence before giving up and
@@ -52,6 +69,16 @@
  * attempt can wait up to the 1000ms IRQ timeout).
  */
 #define ACQUIRE_MAX_RETRIES (5)
+
+/**
+ * @brief Print a per-stage timing breakdown of the acquisition loop once per second.
+ *
+ * The XIAO receives every frame this board produces with zero errors, so the frame rate is set
+ * entirely here, not by the SPI link. Measured 4.7fps = ~213ms/frame, of which UART (75.6ms at
+ * 3Mbaud) and SPI (50.3ms at 3.9MHz) only account for ~126ms - so something else owns the other
+ * ~87ms. Rather than guess which stage, time them all. Turn off once the pipeline is tuned.
+ */
+#define CONF_PROFILE_TIMING (1)
 
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
@@ -93,13 +120,178 @@ static void handle_error_impl(int line);
  * below tells you exactly which check tripped - grep vl53l9_app.c for that line number.
  */
 #define handle_error() handle_error_impl(__LINE__)
-#if CONF_STREAM_VISUALIZER
+#if CONF_STREAM_VISUALIZER || CONF_STREAM_SPI
+/**
+ * @brief Shared by both the UART (send_vis_frame) and SPI (send_vis_frame_spi) transports below, so
+ * there's exactly one CRC implementation to keep in sync with the receiving ends - not two copies
+ * that could silently drift apart. Declared/defined under this combined guard so it's still available
+ * if CONF_STREAM_VISUALIZER is ever turned off while CONF_STREAM_SPI stays on (or vice versa).
+ */
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len, uint16_t crc);
+#endif
+#if CONF_STREAM_VISUALIZER
 static void send_vis_frame(uint32_t frame_counter, uint8_t width, uint8_t height, const float *amplitude,
                             const float *depth, const float *ambient);
 #endif
+#if CONF_STREAM_SPI
+/**
+ * @brief SPI has no built-in framing, so every transaction is this fixed length regardless of the
+ * frame's actual width*height (see the handshake/padding note in send_vis_frame_spi()). Matches
+ * SPI_FRAME_BYTES in the XIAO's spi.ino exactly - 12 (header) + 2268 * (4+2+4) = 22692 bytes.
+ */
+#define SPI_FRAME_BYTES (sizeof(vis_frame_header_t) + VIS_MAX_PLANE_PIXELS * (sizeof(float) + sizeof(uint16_t) + sizeof(float)))
+/* A frame goes out as SPI_CHUNK_COUNT separate transactions, each its own CS assert + READY
+ * handshake, rather than one 22692-byte transfer. Espressif's SPI slave docs note the receiver
+ * "cannot recognize or receive data correctly if the clock is too fast", and that hosts should
+ * write lengths that are multiples of 4 bytes. Empirically a single full-frame transaction died
+ * ~4000 bits in, at bit counts that were NOT multiples of 8 - a master cannot clock a partial
+ * byte, so the slave was dropping SCK edges and losing sync mid-transaction. Chunking gives it a
+ * clean CS resync point 12x per frame and lets the receiver verify each piece independently.
+ * Must match SPI_CHUNK_BYTES in the XIAO's spi.ino exactly - wire-protocol constant, so both
+ * sides must be reflashed together when it changes. */
+/* DIAGNOSTIC MODE. Set to 1 to send a known byte ramp instead of real sensor data: every chunk is
+ * filled so that byte k of the whole padded frame == (k & 0xFF). The XIAO has a matching flag and
+ * checks each received chunk against that ramp, reporting the first mismatching offset. This takes
+ * frame layout, CRC and chunk assembly entirely out of the picture so the raw link can be measured
+ * on its own - specifically it distinguishes "no data at all" from "data arrives but shifted by N
+ * bytes" (which means the slave armed mid-transfer) from "data arrives but corrupted" (electrical
+ * or SPI mode). Set back to 0 once the link is proven. Must match SPI_TEST_PATTERN in spi.ino. */
+/* RAW LINK TEST. Set to 1 to bypass SPI entirely and drive SCK/MOSI/NSS as plain GPIO outputs at
+ * three different slow rates, so the XIAO (matching flag in spi.ino) can count transitions on each
+ * wire independently of any SPI configuration on either side.
+ *
+ * Why this exists: with a 64-byte transfer at 976kHz the master reports every frame sent OK and the
+ * handshake never errors, yet the slave counts ZERO clock edges - even during all-FF, where MOSI is
+ * held high the whole transfer. CS demonstrably works (transactions start and end, and the READY
+ * edge handshake succeeds 37/37), so the slave is seeing CS but not SCK. Everything checkable in
+ * software on the STM32 side has been verified against primary sources, so the next thing to
+ * measure is the wires themselves - one at a time, at a speed where nothing subtle can matter.
+ *
+ * NSS/CS is the built-in control: we already know that path works, so if the XIAO counts NSS
+ * transitions but not SCK transitions, that is a measured per-wire result with a working reference,
+ * not a guess. Set back to 0 to resume normal operation. */
+#define SPI_LINK_GPIO_TEST (0)
+
+#define SPI_TEST_PATTERN (0)
+/* In test mode, shrink the problem to the smallest thing that could possibly work: ONE transaction
+ * of SPI_TEST_BYTES per frame, at the slowest clock the prescaler offers (/256, ~976kHz - see
+ * MX_SPI4_Init). Everything on the STM32 side has been verified correct against primary sources
+ * (pin + AF5 against ST's CubeMX database, the clock chain against SystemClock_Config and the CMSIS
+ * headers, HAL_SPI_Transmit against the HAL source), and the master reports all chunks sent, yet
+ * the slave still captures ~25% of the bits with a beating/aliased pattern. So rather than keep
+ * inspecting a 2048-byte 12-chunk transfer, bisect: if 64 bytes at 976kHz arrives perfectly, the
+ * link is sound and the fault is size/timing dependent, and the size can be walked back up to find
+ * the breaking point. If even this fails, the fault is fundamental and independent of both. */
+#define SPI_TEST_BYTES (64)
+#define SPI_CHUNK_BYTES (2048)
+#define SPI_CHUNK_COUNT ((SPI_FRAME_BYTES + SPI_CHUNK_BYTES - 1) / SPI_CHUNK_BYTES) /* 12 */
+#define SPI_PADDED_FRAME_BYTES (SPI_CHUNK_COUNT * SPI_CHUNK_BYTES)                  /* 24576 */
+#define SPI_READY_TIMEOUT_MS (200)   /**< how long to wait for the XIAO's READY handshake before skipping this frame */
+/* ~92.9ms of actual transfer at the current 1.95MHz (SPI_BAUDRATEPRESCALER_128) SCK - was 100ms
+ * (a ~7% margin, not "generous") until this got caught: I dropped the clock 8x when testing a
+ * crosstalk hypothesis but forgot this constant assumed the old 15.625MHz timing. 500ms gives
+ * real headroom against interrupt latency (I3C/TIM3/USB) stretching the transfer. Re-check this
+ * value again if the clock is ever raised back toward /16. */
+#define SPI_TRANSFER_TIMEOUT_MS (500)
+/* Guard delays around the SPI handshake - see the long comment in send_vis_frame_spi(). These
+ * cover the gap between the XIAO's spi_slave_queue_trans() returning (which is when it raises
+ * READY) and its SPI slave hardware actually being armed by the driver's own ISR/task context.
+ * 200us is deliberately generous: at 4fps this costs 0.08% of the frame budget, so there is no
+ * reason to trim it close. Only worth revisiting if the frame rate ever climbs high enough that
+ * a fifth of a millisecond per frame actually matters. */
+#define SPI_READY_TO_CS_DELAY_US (200)
+#define SPI_CS_SETUP_DELAY_US (10)
+#define SPI_CS_HOLD_DELAY_US (10)
+
+/**
+ * @brief Busy-wait for approximately @p us microseconds.
+ *
+ * HAL_Delay()'s 1ms granularity is far too coarse for the sub-millisecond guard delays the SPI
+ * handshake needs, and its tick-phase rounding means HAL_Delay(1) can return almost immediately.
+ * This is only ever called with small values around a single SPI transaction, so a NOP loop is
+ * simpler than standing up DWT's cycle counter. `volatile` is what keeps -Ofast (this project's
+ * optimization level) from deleting the loop outright as having no observable effect.
+ */
+#if SPI_LINK_GPIO_TEST
+/**
+ * @brief Drive SCK/MOSI/NSS as plain GPIO outputs at three distinct rates, forever. Never returns.
+ *
+ * Each wire gets its own toggle rate so the receiving side can tell them apart by transition count
+ * alone, with no shared clock, no framing and no SPI peripheral involved on either end:
+ *   SCK  (PE12) toggles every  50ms -> ~20 transitions/sec
+ *   MOSI (PE14) toggles every 100ms -> ~10 transitions/sec
+ *   NSS  (PE11) toggles every 200ms -> ~5  transitions/sec
+ */
+static void spi_link_gpio_test(void) {
+    GPIO_InitTypeDef gpio = {0};
+    __HAL_RCC_GPIOE_CLK_ENABLE();
+
+    /* Take SCK and MOSI back from SPI4's alternate function - MX_SPI4_Init/HAL_SPI_MspInit set them
+     * to AF5 at startup, and this test needs them as plain outputs. NSS is already a plain output. */
+    gpio.Pin = GPIO_PIN_12 | GPIO_PIN_14 | SPI4_NSS_Pin;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOE, &gpio);
+
+    printf("SPI_LINK_GPIO_TEST: driving SCK(PE12)=20 transitions/s, MOSI(PE14)=10/s, NSS(PE11)=5/s\n");
+    printf("SPI_LINK_GPIO_TEST: SPI is NOT running in this mode - this measures the wires only.\n");
+
+    uint32_t last_report = HAL_GetTick();
+    while (1) {
+        uint32_t t = HAL_GetTick();
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_12, ((t / 50U) & 1U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_14, ((t / 100U) & 1U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOE, SPI4_NSS_Pin, ((t / 200U) & 1U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+        if ((t - last_report) >= 1000U) {
+            last_report = t;
+            printf("SPI_LINK_GPIO_TEST: still driving (t=%lums) READY(PE9) reads %d\n", (unsigned long)t,
+                   (int)HAL_GPIO_ReadPin(XIAO_READY_GPIO_Port, XIAO_READY_Pin));
+        }
+    }
+}
+#endif /* SPI_LINK_GPIO_TEST */
+
+static void spi_bridge_delay_us(uint32_t us) {
+    /* ~4 core cycles per iteration of this loop; SystemCoreClock is 250MHz on this board. */
+    volatile uint32_t cycles = (SystemCoreClock / 1000000UL) * us / 4UL;
+    while (cycles-- > 0UL) {
+        __NOP();
+    }
+}
+
+/**
+ * @brief Block until the XIAO's READY line reaches @p level, or SPI_READY_TIMEOUT_MS elapses.
+ * @return true if the level was reached, false on timeout.
+ *
+ * The handshake is edge-based, not level-based, and that distinction is the whole point: after a
+ * chunk is clocked out, READY is still HIGH from that same chunk until the XIAO's ISR drops it. A
+ * master that only waits for "READY == HIGH" would read that stale HIGH as "armed for the next
+ * chunk" and start clocking into an unarmed slave. So between chunks we wait for LOW (the slave
+ * acknowledged the previous transaction ended) and only then for HIGH (it has re-armed).
+ */
+static bool spi_wait_ready(GPIO_PinState level) {
+    uint32_t wait_start = HAL_GetTick();
+    while (HAL_GPIO_ReadPin(XIAO_READY_GPIO_Port, XIAO_READY_Pin) != level) {
+        if ((HAL_GetTick() - wait_start) > SPI_READY_TIMEOUT_MS) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void send_vis_frame_spi(uint32_t frame_counter, uint8_t width, uint8_t height, const float *amplitude,
+                                const float *depth, const float *ambient);
+#endif
 
 void vl53l9_app() {
+
+#if CONF_STREAM_SPI && SPI_LINK_GPIO_TEST
+    /* Raw wire measurement mode - never returns. Runs before the sensor is touched so nothing else
+     * can interfere with, or be blamed for, what the pins are doing. */
+    spi_link_gpio_test();
+#endif
 
     /* checkpoint prints: pinpoint exactly how far setup gets before a silent hang/crash */
     printf("vl53l9_app: starting (CONF_STREAM_VISUALIZER=%d)\n", CONF_STREAM_VISUALIZER);
@@ -196,7 +388,7 @@ void vl53l9_app() {
     properties_add(depth_props, &depth_height);
     capabilities_t *depth_caps = capabilities_new_simple(&depth_props);
 
-#if CONF_STREAM_VISUALIZER
+#if CONF_STREAM_VISUALIZER || CONF_STREAM_SPI
     /* build amplitude stream capabilities (same resolution as depth, used as the "image" for the PC visualizer) */
     property_t amp_format = { "format", { .val.v_string = "AF32", .tid = VTID_STRING } };
     property_t amp_width = { "width", { .val.v_uint32 = out_width, .tid = VTID_UINT32 } };
@@ -232,7 +424,7 @@ void vl53l9_app() {
         handle_error();
     }
 
-#if CONF_STREAM_VISUALIZER
+#if CONF_STREAM_VISUALIZER || CONF_STREAM_SPI
     ret = transform_set_stream_capabilities(p_transform, "amplitude", amp_caps);
     if (ret) {
         handle_error();
@@ -249,7 +441,7 @@ void vl53l9_app() {
     properties_free(depth_props, NULL);
     capabilities_free(raw_caps, NULL);
     capabilities_free(depth_caps, NULL);
-#if CONF_STREAM_VISUALIZER
+#if CONF_STREAM_VISUALIZER || CONF_STREAM_SPI
     properties_free(amp_props, NULL);
     capabilities_free(amp_caps, NULL);
     properties_free(ambient_props, NULL);
@@ -283,7 +475,7 @@ void vl53l9_app() {
     stream_buffer_t in_raw_stream_buffer = { .name = "raw", .buffer = { .memories = &in_raw_mems, .nb = 1 } };
     stream_buffer_t out_depth_stream_buffer = { .name = "depth", .buffer = { .memories = &out_depth_mems, .nb = 1 } };
 
-#if CONF_STREAM_VISUALIZER
+#if CONF_STREAM_VISUALIZER || CONF_STREAM_SPI
     /* amplitude/ambient outputs, same resolution/size as depth (AF32/IF32 are float32 like ZF32) */
     memory_t out_amp_mem = allocate_memory(frame_buffer_size);
     memories_t out_amp_mems = { .items = &out_amp_mem, .size = 1, .capacity = 1, .item_size = sizeof(memory_t) };
@@ -300,12 +492,12 @@ void vl53l9_app() {
                                             (stream_buffer_t[]){
                                                 in_raw_stream_buffer,
                                                 out_depth_stream_buffer,
-#if CONF_STREAM_VISUALIZER
+#if CONF_STREAM_VISUALIZER || CONF_STREAM_SPI
                                                 out_amp_stream_buffer,
                                                 out_ambient_stream_buffer,
 #endif
                                             },
-#if CONF_STREAM_VISUALIZER
+#if CONF_STREAM_VISUALIZER || CONF_STREAM_SPI
                                         .size = 4,
                                         .capacity = 4,
 #else
@@ -354,6 +546,9 @@ void vl53l9_app() {
          * behavior), retry the whole trigger/wait/read sequence a bounded number of times. This also
          * subsumes the vl53l9_trigger_frame() discarded-return-value bug from the unmodified example
          * (its result is now checked, as part of this retry loop). */
+#if CONF_PROFILE_TIMING
+        uint32_t t_loop_start = platform_profiler_get_timestamp();
+#endif
         int acquire_attempt;
         for (acquire_attempt = 0; acquire_attempt < ACQUIRE_MAX_RETRIES; acquire_attempt++) {
             platform_acknowledge_event(PLATFORM_GPIO_IT_EVT); /* flush any stale flag before this attempt */
@@ -387,6 +582,9 @@ void vl53l9_app() {
             handle_error();
         }
 
+#if CONF_PROFILE_TIMING
+        uint32_t t_after_acquire = platform_profiler_get_timestamp();
+#endif
         /* process the previous frame while the sensor is acquiring the next one */
         if (is_first_frame) {
             is_first_frame = false;
@@ -400,6 +598,9 @@ void vl53l9_app() {
             depth_ready = true;
         }
 
+#if CONF_PROFILE_TIMING
+        uint32_t t_after_transform = platform_profiler_get_timestamp();
+#endif
         ret = platform_wait_for_event(PLATFORM_I3C_DMA_RX_EVT, 1000);
         if (ret) {
             handle_error();
@@ -418,6 +619,9 @@ void vl53l9_app() {
             handle_error();
         }
 
+#if CONF_PROFILE_TIMING
+        uint32_t t_after_readout = platform_profiler_get_timestamp();
+#endif
         /* measure frame rate */
         stop_time = platform_profiler_get_timestamp();
         frame_rate = (1.0f / (float)(platform_profiler_convert_to_us(stop_time - start_time))) * 1000000;
@@ -427,9 +631,40 @@ void vl53l9_app() {
             print_frame((float *)out_depth_mem.data, out_height, out_width);
             printf("Processed frame n. %lu @ %u fps\n", (unsigned long)frame.p_metadata->frame_counter,
                    (unsigned int)frame_rate);
+#if CONF_PROFILE_TIMING
+            uint32_t t_before_uart = platform_profiler_get_timestamp();
+#endif
 #if CONF_STREAM_VISUALIZER
             send_vis_frame(frame.p_metadata->frame_counter, out_width, out_height, (const float *)out_amp_mem.data,
                             (const float *)out_depth_mem.data, (const float *)out_ambient_mem.data);
+#endif
+#if CONF_PROFILE_TIMING
+            uint32_t t_after_uart = platform_profiler_get_timestamp();
+#endif
+#if CONF_STREAM_SPI
+            send_vis_frame_spi(frame.p_metadata->frame_counter, out_width, out_height, (const float *)out_amp_mem.data,
+                                (const float *)out_depth_mem.data, (const float *)out_ambient_mem.data);
+#endif
+#if CONF_PROFILE_TIMING
+            {
+                /* Rate-limited to one line per second: the point is the steady-state split between
+                 * stages, not every frame. All values in milliseconds. "print" is the ascii-art +
+                 * "Processed frame" printf above, which also goes out over the same 3Mbaud UART. */
+                static uint32_t last_profile_ms = 0;
+                uint32_t now_ms = HAL_GetTick();
+                if ((now_ms - last_profile_ms) >= 1000U) {
+                    uint32_t t_end = platform_profiler_get_timestamp();
+                    last_profile_ms = now_ms;
+                    printf("PROFILE ms: acquire=%lu transform=%lu readout=%lu print=%lu uart=%lu spi=%lu | total=%lu\n",
+                           (unsigned long)(platform_profiler_convert_to_us(t_after_acquire - t_loop_start) / 1000U),
+                           (unsigned long)(platform_profiler_convert_to_us(t_after_transform - t_after_acquire) / 1000U),
+                           (unsigned long)(platform_profiler_convert_to_us(t_after_readout - t_after_transform) / 1000U),
+                           (unsigned long)(platform_profiler_convert_to_us(t_before_uart - t_after_readout) / 1000U),
+                           (unsigned long)(platform_profiler_convert_to_us(t_after_uart - t_before_uart) / 1000U),
+                           (unsigned long)(platform_profiler_convert_to_us(t_end - t_after_uart) / 1000U),
+                           (unsigned long)(platform_profiler_convert_to_us(t_end - t_loop_start) / 1000U));
+                }
+            }
 #endif
         }
 
@@ -504,10 +739,12 @@ static void handle_error_impl(int line) {
         ;
 }
 
-#if CONF_STREAM_VISUALIZER
+#if CONF_STREAM_VISUALIZER || CONF_STREAM_SPI
 /**
- * @brief CRC-16/CCITT (poly 0x1021, no reflection). Must match the Python-side implementation
- * in Utilities/vl53l9_visualizer.py so the host can validate/resync on the byte stream.
+ * @brief CRC-16/CCITT (poly 0x1021, no reflection). Must match the Python-side implementation in
+ * Utilities/vl53l9_visualizer.py and the XIAO-side implementation in stm32_utility/spi/spi.ino so
+ * every receiving end can validate/resync on the byte stream. Shared by both send_vis_frame() (UART)
+ * and send_vis_frame_spi() (SPI) below - see the combined guard note at this function's declaration.
  */
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len, uint16_t crc) {
     for (size_t i = 0; i < len; i++) {
@@ -518,7 +755,9 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len, uint16_t crc) {
     }
     return crc;
 }
+#endif /* CONF_STREAM_VISUALIZER || CONF_STREAM_SPI */
 
+#if CONF_STREAM_VISUALIZER
 /**
  * @brief Send one amplitude+depth+ambient frame to the PC over the COM1 UART as a binary packet, for
  * live visualization by Utilities/vl53l9_visualizer.py. Blocking (uses HAL_UART_Transmit), so this
@@ -572,3 +811,169 @@ static void send_vis_frame(uint32_t frame_counter, uint8_t width, uint8_t height
     }
 }
 #endif /* CONF_STREAM_VISUALIZER */
+
+#if CONF_STREAM_SPI
+/**
+ * @brief Send one amplitude+depth+ambient frame to a XIAO ESP32 over SPI4, for the XIAO to re-serve as
+ * a live webpage over WiFi (stm32_utility/spi/spi.ino in the separate Arduino repo). Same wire format,
+ * same mixed-precision quantization and the same CRC as send_vis_frame() above (see that function's
+ * comment for why depth is uint16 but amplitude/ambient stay float32) - only the transport differs.
+ *
+ * Unlike UART, SPI has no built-in framing: the transfer length must be agreed by both sides ahead of
+ * the transaction, and the receiving XIAO can't produce a receive buffer on demand mid-transaction. So
+ * the frame is padded out to SPI_PADDED_FRAME_BYTES and sent as SPI_CHUNK_COUNT fixed-size chunks (the
+ * receiver only reads width*height pixels per plane from the header, so padding is ignored), each chunk
+ * waiting on the XIAO's PIN_READY handshake before asserting the software NSS and clocking it out. If
+ * the XIAO never raises READY (not powered, not flashed, not wired, or still processing) the frame is
+ * abandoned mid-way rather than blocking the whole acquisition loop; the XIAO resyncs to chunk 0 on its
+ * side. Failures here are independent of, and must not affect, the UART path above.
+ */
+static void send_vis_frame_spi(uint32_t frame_counter, uint8_t width, uint8_t height, const float *amplitude,
+                                const float *depth, const float *ambient) {
+    static uint8_t tx_buf[SPI_PADDED_FRAME_BYTES];
+    static uint16_t depth_q[VIS_MAX_PLANE_PIXELS];
+
+    size_t pixels = (size_t)width * height;
+    if (pixels > VIS_MAX_PLANE_PIXELS) {
+        handle_error(); /* should never happen for a supported binning value, see VIS_MAX_PLANE_PIXELS */
+    }
+
+    for (size_t i = 0; i < pixels; i++) {
+        depth_q[i] = (uint16_t)MIN(MAX(depth[i] + 0.5f, 0.0f), 65535.0f);
+    }
+
+    vis_frame_header_t header;
+    memcpy(header.magic, "VL59", sizeof(header.magic));
+    header.frame_counter = frame_counter;
+    header.width = width;
+    header.height = height;
+
+    size_t amp_bytes = pixels * sizeof(float);
+    size_t depth_bytes = pixels * sizeof(uint16_t);
+    size_t ambient_bytes = pixels * sizeof(float);
+    size_t total = sizeof(header) + amp_bytes + depth_bytes + ambient_bytes;
+
+    uint16_t crc = crc16_ccitt((const uint8_t *)amplitude, amp_bytes, 0);
+    crc = crc16_ccitt((const uint8_t *)depth_q, depth_bytes, crc);
+    crc = crc16_ccitt((const uint8_t *)ambient, ambient_bytes, crc);
+    header.crc16 = crc;
+
+    memcpy(tx_buf, &header, sizeof(header));
+    memcpy(tx_buf + sizeof(header), amplitude, amp_bytes);
+    memcpy(tx_buf + sizeof(header) + amp_bytes, depth_q, depth_bytes);
+    memcpy(tx_buf + sizeof(header) + amp_bytes + depth_bytes, ambient, ambient_bytes);
+    /* Pad out to the full chunked length so every transaction is exactly SPI_CHUNK_BYTES - the tail
+     * beyond `total` is don't-care, the receiver sizes each plane from the header. */
+    if (total < SPI_PADDED_FRAME_BYTES) {
+        memset(tx_buf + total, 0, SPI_PADDED_FRAME_BYTES - total);
+    }
+
+#if SPI_TEST_PATTERN
+    /* Cycle through four diagnostic patterns, switching every 5 seconds so each one spans several
+     * of the once-per-second log lines on both sides and the transitions are obvious when the two
+     * logs are lined up.
+     *
+     * The constant patterns are the point. A ramp cannot tell "MOSI carries no real data" apart
+     * from "MOSI is fine but sampling timing is wrong" - both look like garbage. A CONSTANT must
+     * survive any timing error whatsoever: if the master holds MOSI low for the whole transfer,
+     * every sample must read 0x00 no matter when it is taken. So:
+     *   all-00 reads 00 AND all-FF reads FF -> the MOSI data path works; the fault is timing/framing
+     *   all-FF does not read back as FF     -> MOSI is not carrying the master's data at all
+     *   all-AA (01010101) reading as 55/33/0F -> sampling at the wrong rate or edge */
+    uint32_t test_phase = (HAL_GetTick() / 5000U) % 4U;
+    uint8_t fill = 0x00;
+    const char *pattern_name = "ramp";
+    switch (test_phase) {
+        case 1: fill = 0x00; pattern_name = "all-00"; break;
+        case 2: fill = 0xFF; pattern_name = "all-FF"; break;
+        case 3: fill = 0xAA; pattern_name = "all-AA"; break;
+        default: break;
+    }
+    for (size_t i = 0; i < SPI_PADDED_FRAME_BYTES; i++) {
+        tx_buf[i] = (test_phase == 0U) ? (uint8_t)(i & 0xFF) : fill;
+    }
+
+    static uint32_t last_pattern_log_ms = 0;
+    uint32_t pattern_now = HAL_GetTick();
+    if ((pattern_now - last_pattern_log_ms) >= 1000U) {
+        last_pattern_log_ms = pattern_now;
+        printf("TESTTX: pattern=%s first16: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X "
+               "%02X %02X\n",
+               pattern_name, tx_buf[0], tx_buf[1], tx_buf[2], tx_buf[3], tx_buf[4], tx_buf[5], tx_buf[6], tx_buf[7],
+               tx_buf[8], tx_buf[9], tx_buf[10], tx_buf[11], tx_buf[12], tx_buf[13], tx_buf[14], tx_buf[15]);
+    }
+#endif
+
+    /* Send the frame as SPI_CHUNK_COUNT separate transactions. Each one re-waits for READY, because
+     * the XIAO re-arms its SPI slave between every chunk (spi_slave_queue_trans() only posts to a
+     * FreeRTOS queue - the driver's task/ISR context programs the DMA and arms the peripheral some
+     * tens of microseconds later, and this loop polls READY at 250MHz, so without the guard delay
+     * below the master would start clocking into a slave that isn't listening yet). */
+    HAL_StatusTypeDef status = HAL_OK;
+#if SPI_TEST_PATTERN
+    /* Bisection mode: one small transaction per frame - see SPI_TEST_BYTES. */
+    const size_t chunk_bytes = SPI_TEST_BYTES;
+    const size_t chunk_count = 1;
+#else
+    const size_t chunk_bytes = SPI_CHUNK_BYTES;
+    const size_t chunk_count = SPI_CHUNK_COUNT;
+#endif
+
+    if (!spi_wait_ready(GPIO_PIN_SET)) {
+        printf("send_vis_frame_spi: XIAO not ready at frame start (timeout)\n");
+        return;
+    }
+
+    for (size_t chunk = 0; chunk < chunk_count; chunk++) {
+        spi_bridge_delay_us(SPI_READY_TO_CS_DELAY_US);
+
+        HAL_GPIO_WritePin(SPI4_NSS_GPIO_Port, SPI4_NSS_Pin, GPIO_PIN_RESET); /* select (active low) */
+        /* CS setup: let the slave's CS-detect logic latch the transaction start before the first
+         * SCK edge arrives. */
+        spi_bridge_delay_us(SPI_CS_SETUP_DELAY_US);
+
+        status = HAL_SPI_Transmit(&hspi4, tx_buf + chunk * chunk_bytes, (uint16_t)chunk_bytes,
+                                  SPI_TRANSFER_TIMEOUT_MS);
+
+        /* CS hold: HAL_SPI_Transmit returns on EOT, but let the last bits settle at the slave before
+         * releasing CS so the tail of the chunk isn't truncated by an early deassert. */
+        spi_bridge_delay_us(SPI_CS_HOLD_DELAY_US);
+        HAL_GPIO_WritePin(SPI4_NSS_GPIO_Port, SPI4_NSS_Pin, GPIO_PIN_SET); /* deselect */
+
+        if (status != HAL_OK) {
+            printf("send_vis_frame_spi: HAL_SPI_Transmit failed at chunk %u/%u (status=%d)\n", (unsigned)chunk,
+                   (unsigned)chunk_count, (int)status);
+            return;
+        }
+
+        /* Edge handshake before the next chunk: LOW confirms the slave saw this transaction end,
+         * HIGH confirms it has re-armed. Skipped after the final chunk - the slave re-arms during
+         * the idle gap before the next frame, which the frame-start wait above covers. */
+        if ((chunk + 1) < chunk_count) {
+            if (!spi_wait_ready(GPIO_PIN_RESET)) {
+                printf("send_vis_frame_spi: READY stuck high after chunk %u/%u\n", (unsigned)chunk,
+                       (unsigned)chunk_count);
+                return; /* abandon frame; the XIAO resyncs to chunk 0 on its side */
+            }
+            if (!spi_wait_ready(GPIO_PIN_SET)) {
+                printf("send_vis_frame_spi: XIAO did not re-arm after chunk %u/%u\n", (unsigned)chunk,
+                       (unsigned)chunk_count);
+                return;
+            }
+        }
+    }
+
+    /* Every chunk went out (the loop returns early on any failure, so reaching here means all of
+     * them). Rate-limited rather than silent - lets a bare picocom session confirm sends really are
+     * happening and at what rate, without flooding the console. Correlate the frame_counter/crc16
+     * printed here against what the XIAO logs to tell "STM32 isn't really sending" apart from "it's
+     * sending, but the XIAO can't validate it". */
+    static uint32_t last_ok_log_ms = 0;
+    uint32_t now = HAL_GetTick();
+    if ((now - last_ok_log_ms) >= 1000) {
+        last_ok_log_ms = now;
+        printf("send_vis_frame_spi: sent frame %lu OK (crc=0x%04X, %u chunks x %u bytes)\n",
+               (unsigned long)frame_counter, header.crc16, (unsigned)chunk_count, (unsigned)chunk_bytes);
+    }
+}
+#endif /* CONF_STREAM_SPI */

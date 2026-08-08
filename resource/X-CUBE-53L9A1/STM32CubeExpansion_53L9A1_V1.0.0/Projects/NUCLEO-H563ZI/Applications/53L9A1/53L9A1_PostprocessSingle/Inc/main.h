@@ -143,7 +143,25 @@ void Error_Handler(void);
 #define DEBUG_GPIO_2_GPIO_Port GPIOE
 
 /* USER CODE BEGIN Private defines */
-
+/**
+ * Hand-added (not CubeMX-regenerated) for the STM32 -> XIAO SPI bridge - see
+ * MX_SPI4_Init()/HAL_SPI_MspInit() and send_vis_frame_spi() in vl53l9_app.c, and
+ * stm32_utility/spi/spi.ino in the separate Arduino repo for the receiving side.
+ *
+ * Verified free of the X-NUCLEO-53L9A1 shield's pins (I3C1 on PB8/PB9, XSHUT on
+ * PB6, INTR on PB7, SYNC_IN on PB1, TIM3_CH2 on PB5, the 3 status LEDs) and of the
+ * "uart" sibling sketch's link (USART6 on PG14/PG9), cross-checked against this
+ * project's own .ioc and the Nucleo-144 Zio connector map. SPI4_SCK (PE12),
+ * SPI4_MISO (PE13) and SPI4_MOSI (PE14) are real SPI4/AF5 pins per ST's own
+ * CubeMX pin database (db/mcu/STM32H563ZITx.xml) - not a guess. SPI4_NSS (PE11)
+ * is driven as a plain output GPIO (software-managed NSS), not the SPI
+ * peripheral's hardware NSS. Arduino D-numbers, where the pin has one: PE13=D3,
+ * PE14=D4, PE11=D5, PE9=D6 (PE12 is Zio-only, no base D0-D15 label).
+ */
+#define SPI4_NSS_Pin GPIO_PIN_11
+#define SPI4_NSS_GPIO_Port GPIOE
+#define XIAO_READY_Pin GPIO_PIN_9
+#define XIAO_READY_GPIO_Port GPIOE
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

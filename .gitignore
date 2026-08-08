@@ -79,3 +79,14 @@ Thumbs.db
 *~
 *.swp
 *.swo
+
+# Serial captures written into the repo root by capture_logs.sh / capture_stm32.sh. These are
+# throwaway debugging artifacts, regenerated on every run, and the STM32 ones are large (the
+# 3Mbaud stream is binary visualizer frames interleaved with text).
+/stm32.log
+/stm32*.log
+/stm32*.log.raw
+/stm32_raw.bin
+/xiao.log
+/xiao*.log
+/full.log

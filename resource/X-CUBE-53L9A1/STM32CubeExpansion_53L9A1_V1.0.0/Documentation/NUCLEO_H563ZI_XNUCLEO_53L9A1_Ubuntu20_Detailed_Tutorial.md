@@ -35,9 +35,10 @@ If you're picking this project back up after a break, read [Quick Start](#1-quic
 8. [Debugging Methodology: How SW1 Was Found](#8-debugging-methodology-how-sw1-was-found)
 9. [Troubleshooting Checklist](#9-troubleshooting-checklist)
 10. [Command Reference](#10-command-reference)
-11. [Future Work: Wi-Fi via XIAO ESP32-S3](#11-future-work-wi-fi-via-xiao-esp32-s3)
+11. [STM32 → XIAO Bridge: SPI + Wi-Fi Live Visualizer](#11-stm32--xiao-bridge-spi--wi-fi-live-visualizer)
 12. [Key Takeaways](#12-key-takeaways)
 13. [Reference Paths](#13-reference-paths)
+14. [SPI Bridge Debugging Record & Frame-Rate Budget](#14-spi-bridge-debugging-record--frame-rate-budget)
 
 ---
 
@@ -798,39 +799,122 @@ print/x $r0
 
 ---
 
-# 11. Future Work: Wi-Fi via XIAO ESP32-S3
+# 11. STM32 → XIAO Bridge: SPI + Wi-Fi Live Visualizer
 
-Not yet built. The binary-streaming idea this section originally proposed *was* implemented (see
-[Section 6](#6-the-pc-visualizer)) - but directly over the existing ST-LINK USB-serial link, without
-adding this Wi-Fi hop. The wire protocol that shipped differs in detail from the sketch originally
-drafted here (mixed uint16/float32 fields, a 4-byte string magic, CRC-16 rather than CRC32) but is
-the same core idea. This XIAO bridge remains a reasonable option if/when wireless (rather than
-USB-tethered) access is actually needed:
+Implemented. Adds a second consumer of the same amplitude/depth/ambient frames the PC visualizer
+already streams (see [Section 6](#6-the-pc-visualizer)) - a XIAO ESP32 (S3/C6/C5) that receives them
+over SPI instead of UART and re-serves them as a live webpage over Wi-Fi, removing the need for a PC
+physically tethered to the STM32's ST-LINK USB port:
 
 ```text
 VL53L9CX --I3C--> STM32H563 --raw acquisition/post-processing--> depth/amplitude/ambient frame
-    --USART6--> XIAO ESP32-S3 --Wi-Fi--> PC / Python / Web UI / Server
+    --SPI4--> XIAO ESP32 (S3/C6/C5) --Wi-Fi--> any browser on the LAN, http://<xiao-ip>/
 ```
 
-## Wiring (a UART pair avoiding the X-NUCLEO-53L9A1 pins)
+Both sides use the identical wire format (header + amplitude/depth/ambient planes + CRC-16/CCITT)
+already documented in [Section 6.2](#62-wire-protocol) - only the transport changed, not the frame
+layout. Code lives in two places: the STM32 side is `MX_SPI4_Init()` / `HAL_SPI_MspInit()` /
+`send_vis_frame_spi()` in this project's `vl53l9_app.c`/`main.c`/`stm32h5xx_hal_msp.c` (gated by
+`CONF_STREAM_SPI`, independent of `CONF_STREAM_VISUALIZER` - either or both can be on); the XIAO side
+is a separate Arduino sketch at `~/Arduino/arduino_projects/seeed_xiao/stm32_utility/spi/spi.ino`
+(not part of this STM32 project's build).
+
+An earlier UART-based prototype of this same idea (`stm32_utility/uart/uart.ino` in the Arduino repo)
+is still there as a simpler diagnostic - plain USART6 passthrough to USB Serial, no Wi-Fi, no SPI. The
+SPI+Wi-Fi version superseded it as "the" bridge; the UART one is kept as a minimal link-level sanity
+check if the SPI path is ever misbehaving.
+
+## 11.1 SPI4 wiring
+
+Pins chosen by cross-checking this project's own `.ioc` (for what the X-NUCLEO-53L9A1 shield and the
+`uart.ino` prototype already occupy) against ST's own CubeMX pin database (`db/mcu/STM32H563ZITx.xml`,
+bundled with STM32CubeIDE) for a real SPI4/AF5 hardware pin group - not guessed, not bit-banged:
 
 ```text
-NUCLEO-H563ZI                         XIAO ESP32-S3
-PG14 / Arduino D2 / USART6_TX   ->   D7 / GPIO44 / RX
-PG9  / Arduino D12 / USART6_RX  <-   D6 / GPIO43 / TX
-GND                              ---  GND
+NUCLEO-H563ZI (SPI4, master)              XIAO ESP32 S3/C6/C5 (SPI2_HOST, slave)
+PE12          (Zio only, no D-number) ->  D8  -- SCK
+PE13 / Arduino D3                     ->  D9  -- MISO
+PE14 / Arduino D4                     ->  D10 -- MOSI
+PE11 / Arduino D5                     ->  D3  -- CS (software-managed NSS on the STM32 side)
+PE9  / Arduino D6                     ->  D0  -- PIN_READY (XIAO -> STM32 handshake, see 11.2)
+GND                                    ---     GND
 ```
 
-Cross the UART lines (STM32 TX -> ESP32 RX, STM32 RX <- ESP32 TX). Initially connect only TX/RX/GND;
-when both boards are USB-powered, don't also connect their 5V/3.3V rails together.
+> ### DO NOT USE THE HEADER PIN LABELLED `SCK`
+>
+> The NUCLEO-144 Arduino header has a pin silkscreened **`SCK` (D13)**. That pin is **PA5**, which is
+> `SPI1_SCK`/`SPI6_SCK` - **SPI4 physically cannot drive it** (verified in ST's CubeMX pin database).
+> The clock must come from the pin labelled **PE12** on the Zio connector, which has no Arduino
+> D-number at all.
+>
+> Getting this wrong cost a full day, because the failure looks nothing like a broken wire: CS, MOSI
+> and the READY handshake all work perfectly, every transfer reports `HAL_OK`, the handshake never
+> times out - and the slave counts **zero clock edges**. At higher clock rates a floating SCK input
+> even picks up crosstalk from the neighbouring wires and delivers plausible-looking *aliased* data,
+> which is far more misleading than silence. See Section 14.
 
-## XIAO Arduino code
+MISO/MOSI already encode direction, so same-named pin goes to same-named pin (STM32 MISO to XIAO
+MISO) - unlike UART's TX/RX, these don't cross. All 5 signals verified free of the shield's I3C
+(PB8/PB9), XSHUT (PB6), INTR (PB7), SYNC_IN (PB1), TIM3_CH2 (PB5) and the 3 status LEDs, and free of
+`uart.ino`'s USART6 pins (PG14/PG9).
 
-```cpp
-Serial1.begin(115200, SERIAL_8N1, 44, 43);  // RX=GPIO44, TX=GPIO43
-```
+## 11.2 The handshake and framing
 
-Use USB `Serial` separately for debugging the XIAO itself.
+SPI has no built-in framing and a slave cannot produce data on demand mid-transaction, so the receive
+buffer must be queued *before* the master clocks. Three separate mistakes were made here before it
+worked; all three are worth understanding because each produced a different, misleading symptom.
+
+**A frame is sent as 12 chunks of 2048 bytes** (`SPI_CHUNK_BYTES`), padded to 24576, not as one
+22692-byte transaction. This is a **wire-protocol constant - change it on both sides and reflash both
+together.** (Chunking is not strictly required: with DMA, ESP-IDF bounds slave transfers only by
+internal memory. It was introduced while chasing a symptom whose real cause was the SCK wiring, and
+it costs ~14ms/frame in handshake round-trips. It does buy per-chunk verification and resync points.)
+
+**READY must be driven from the SPI driver's ISR callbacks, never from `loop()`:**
+
+- `spi_slave_queue_trans()` returns **before** the hardware is armed - it only posts to a FreeRTOS
+  queue. Raising READY when it returns tells the master "go" while the slave is still deaf.
+  `post_setup_cb` fires when the registers are actually loaded; raise READY there.
+- `post_trans_cb` fires the instant a transaction ends; drop READY there. Doing it in `loop()` leaves
+  READY **stale-HIGH** after a transfer, and with 12 back-to-back chunks there is no idle gap to hide
+  the latency - the master reads the stale level as "armed" and clocks into an unarmed slave.
+- Use ISR-safe `gpio_set_level()` with `IRAM_ATTR`, not `digitalWrite()`.
+- Correspondingly the master uses an **edge** handshake between chunks: wait for READY LOW (slave saw
+  the transaction end), *then* HIGH (slave re-armed). A level-only wait cannot tell stale from fresh.
+
+**The receiver must find the frame boundary itself.** The transport carries no chunk index - a frame
+is just 12 identical transactions - so the receiver cannot tell chunk 0 from chunk 7. It almost always
+starts listening mid-frame (the STM32 is already streaming when the XIAO boots), and treating the
+first chunk seen as chunk 0 locks assembly to a constant wrong offset *forever*: the tail of one frame
+reassembled with the head of the next, header landing mid-buffer. Chunk 0 is self-identifying because
+the `"VL59"` header sits at its offset 0, so the receiver refuses to assemble until a chunk starts
+with the magic, and re-anchors to chunk 0 whenever it sees the magic. That second rule also recovers
+from the master abandoning a frame part-way on a READY timeout and restarting at chunk 0.
+
+**Always check `trans_len`.** `spi_slave_get_trans_result() == ESP_OK` means only that CS toggled - it
+does **not** mean the requested bytes arrived. Without this check the sketch parses whatever is in the
+DMA buffer, which reads as plausible repeating garbage. Zero the buffer between transactions too.
+
+*Generalizable:* any protocol that splits a frame across several equal fixed-size transfers needs
+either a chunk index or a self-identifying first chunk. Length alone is not framing.
+
+## 11.3 Build gotcha: SPI wasn't wired into this project before
+
+This project never used SPI, so two things needed a one-time manual fix (both already applied, both
+worth knowing if the project is ever regenerated from its `.ioc`, which would silently undo them):
+
+1. `HAL_SPI_MODULE_ENABLED` was commented out in `Inc/stm32h5xx_hal_conf.h` - the umbrella
+   `stm32h5xx_hal.h` only pulls in `stm32h5xx_hal_spi.h` (hence `SPI_HandleTypeDef` etc.) when this is
+   defined. Symptom if it regresses: `unknown type name 'SPI_HandleTypeDef'`.
+2. The bundled project's generated `Debug/Drivers/STM32H5xx_HAL_Driver/subdir.mk` and `objects.list`
+   never listed `stm32h5xx_hal_spi.c`/`stm32h5xx_hal_spi_ex.c` at all (CubeIDE only adds a HAL source
+   file to these generated lists when a peripheral using it is configured through the `.ioc`/pin view,
+   which this hand-edit bypassed). Symptom if it regresses on a command-line `make -C Debug`:
+   `undefined reference to HAL_SPI_Init` / `HAL_SPI_Transmit` at the link step, even though the code
+   compiles fine. Both generated files were manually patched (mirroring the existing UART entries) so
+   `make -C Debug all` builds clean end-to-end - confirmed with a real build, not just a syntax check.
+   Opening the project in STM32CubeIDE and re-adding SPI4 through the pin view would regenerate these
+   properly instead of relying on the manual patch.
 
 ---
 
@@ -892,3 +976,123 @@ Utilities/vl53l9-common/platform/platform_utils.c
 Depth-processing pipeline (Section 6.3/6.4 - invalid-distance sentinel, amplitude/ambient source):
 Middlewares/ST/vl53l9-transform-c/vl53l9-transform-c-lib/src/vl53l9_transform.c
 ```
+
+---
+
+# 14. SPI Bridge Debugging Record & Frame-Rate Budget
+
+Getting the STM32 -> XIAO SPI link working took a full day and roughly a dozen wrong turns. This
+section records what was tried, what each symptom actually meant, and the measured performance
+budget, so none of it has to be rediscovered.
+
+## 14.1 Root cause: the wrong pin was called "SCK"
+
+**The clock wire was connected to the header pin silkscreened `SCK` (D13 = PA5) instead of PE12.**
+SPI4 cannot drive PA5 (it is `SPI1_SCK`/`SPI6_SCK`), so the slave never received a clock.
+
+This originated in the wiring instructions, which described the pin as "PE12 / SCK" - and the board
+has a *different* pin wearing that label. The wiring matched the instructions; the instructions were
+wrong.
+
+**Why it took so long to find:** the failure is almost perfectly disguised.
+
+| Observation | What it seemed to mean | What it actually meant |
+|---|---|---|
+| CS, MOSI, READY all work; handshake never times out | link basically fine, data problem | only the clock was missing |
+| Master reports `HAL_OK` on every transfer | data was sent successfully | `HAL_OK` only means the *master's* peripheral finished its side |
+| Slave returns plausible-looking garbage | corruption / dropped SCK edges | floating SCK picking up crosstalk from neighbouring wires |
+| Bit counts not multiples of 8 | slave dropping clock edges | slave latching noise; later, arming mid-byte |
+| Two chips failed *differently* (C5 fixed 5 bits, S3 scattered) | chip or driver bug | different silicon reacting to the same dead line |
+
+**The measurement that cracked it:** bisecting down to one 64-byte transaction at 976 kHz. At large,
+fast transfers a disconnected clock yields *believable* garbage; at tiny, slow transfers it yields an
+unmistakable `trans_len == 0`. **Shrink the problem before theorizing about corrupted data.**
+
+## 14.2 Hypotheses that were wrong (and why)
+
+Recorded so they are not re-tried:
+
+- **"ESP-IDF caps slave transfers at 4092 bytes."** No - 4092 is only the *default* for
+  `max_transfer_sz`. With DMA, transfers are bounded only by available internal memory.
+- **"GPIO-matrix routing is too slow."** No - at 80 MHz and below it behaves identically to IO_MUX.
+- **"The clock is too fast."** No - ÷128 (1.95 MHz) was verified in the flashed ELF by disassembly,
+  and ESP32 slaves handle up to 60 MHz.
+- **"HTTP serving starves the SPI loop."** No - measured identical 4.7 fps and zero bad frames with
+  the browser open and closed.
+- **"The IDE is flashing a stale binary."** No - the workspace tree predated features the chip
+  demonstrably had. The IDE builds the *bundled* tree, the same `Debug/` that `make` writes to.
+- **Wiring was questioned four times after being confirmed.** It was correct relative to the
+  instructions given. When someone says their setup matches the spec, re-audit the spec.
+
+## 14.3 Real bugs found along the way (all fixed, all worth keeping)
+
+Independent of the wiring fault, these were genuine defects:
+
+1. **`trans_len` never checked** - `spi_slave_get_trans_result() == ESP_OK` only means CS toggled.
+   Stale DMA buffer contents were being parsed as data.
+2. **READY driven from `loop()`** instead of the driver's ISR callbacks - stale-HIGH race (Section 11.2).
+3. **Level-based master handshake** - could not distinguish stale READY from fresh; now edge-based.
+4. **No frame alignment** - the receiver could not identify chunk 0 (Section 11.2).
+5. **`SPI_TRANSFER_TIMEOUT_MS` left at 100 ms** after the clock was slowed 8x, leaving ~7% margin on a
+   92.9 ms transfer. *When changing a clock divider, re-check every timeout derived from it.*
+6. **Guard-scope bugs** - `crc16_ccitt()`, and later `out_amp_mem`/`out_ambient_mem`, were declared
+   under `CONF_STREAM_VISUALIZER` only although the SPI path needs them. Both are now guarded
+   `CONF_STREAM_VISUALIZER || CONF_STREAM_SPI`.
+
+## 14.4 Tooling written for this
+
+All in the repo root. See `CLAUDE.md` for the rule that Claude never runs the flashing script.
+
+| Script | Purpose |
+|---|---|
+| `flash_stm32.sh [marker]` | Builds, **refuses to flash unless a marker string is present in the freshly built ELF**, then flashes. Guards against analysing a chip that is running the previous round's firmware. |
+| `capture_logs.sh [secs]` | Records both boards simultaneously into `stm32.log` / `xiao.log` so the two sides line up in time. |
+| `capture_stm32.sh [secs] [baud] [out]` | Single-board capture. Baud is a parameter because ST's official binary is 115200 while the local build is 3000000. |
+
+**Verify what is actually on the chip before trusting any log.** One side of a two-board system can
+silently be a round behind, and both logs still look plausible. Put a unique marker string in each
+build and grep the log for it.
+
+## 14.5 Frame-rate budget (measured, not calculated)
+
+Per-stage timing from `CONF_PROFILE_TIMING` in `vl53l9_app.c`, at 54x42 (binning 2, `AR_PRECISION`):
+
+```text
+acquire     18 ms   sensor trigger + IRQ wait
+transform   42 ms   ST's 11-stage postprocessing pipeline
+readout      1 ms   I3C DMA
+print        0 ms
+uart        83 ms   22692 B at 3 Mbaud, blocking   <- removed (CONF_STREAM_VISUALIZER = 0)
+spi         64 ms   ~50 ms line time + ~14 ms chunk handshakes
+            ------
+total      210 ms   = 4.76 fps
+```
+
+**The 30 fps in the profile table is the *sensor's* acquisition rate, not an end-to-end claim.** ST
+does not claim 30 fps end-to-end anywhere in the package.
+
+**Verified baseline: ST's own unmodified prebuilt binary runs at 16 fps** - which matches this
+project's `acquire + transform + readout` = 61 ms (16.4 fps) exactly. So the 42 ms transform cost is
+simply what ST's pipeline costs on this MCU at this resolution; the local build does not make
+processing slower. Everything including the middleware compiles `-Ofast` with hardware FPU, and ST's
+code uses no double-precision math - neither is a factor.
+
+**~16 fps is therefore the ceiling** at 54x42 with the full pipeline. Reaching it means driving the
+transport cost to approximately nothing:
+
+| Change | Saves | Result |
+|---|---|---|
+| `CONF_STREAM_VISUALIZER = 0` | 83 ms | ~7.9 fps |
+| SPI ÷64 -> ÷16 (15.6 MHz) | ~38 ms | ~11.4 fps |
+| Chunks 12 -> 1 (drops handshake round-trips) | ~13 ms | ~13 fps |
+| **SPI via DMA instead of blocking** | most of the remainder | **~16 fps** |
+
+The acquisition loop already overlaps `transform` with sensor acquisition, but `HAL_SPI_Transmit` is
+blocking, so the SPI transfer is pure dead time. DMA would let it run during acquisition. This is far
+simpler with 1 chunk than with 12.
+
+**To exceed 16 fps** the 42 ms `transform` must shrink. ST exposes seven bypass properties -
+`bypass-tnr-algo`, `bypass-sharpener-filter`, `bypass-fp-filter`, `bypass-conf-filter`,
+`bypass-refl-filter`, `bypass-r2p-algo`, `bypass-r2p-filter` (all default to off, i.e. every stage
+runs). Profile the individual stages before disabling any. Dropping to binning 4 (27x21) quarters the
+pixel count and would approach 30 fps, at half the spatial resolution.

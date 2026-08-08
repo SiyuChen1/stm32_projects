@@ -53,7 +53,8 @@ TIM_HandleTypeDef htim3;
 PCD_HandleTypeDef hpcd_USB_DRD_FS;
 
 /* USER CODE BEGIN PV */
-
+/* Hand-added (not CubeMX-regenerated) - see MX_SPI4_Init() below. */
+SPI_HandleTypeDef hspi4;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -66,7 +67,7 @@ static void MX_I3C1_Init(void);
 static void MX_USB_PCD_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void MX_SPI4_Init(void); /* hand-added, see definition below */
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -110,7 +111,7 @@ int main(void)
   MX_USB_PCD_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-
+  MX_SPI4_Init(); /* hand-added: STM32 -> XIAO SPI bridge, see vl53l9_app.c's send_vis_frame_spi() */
   /* USER CODE END 2 */
 
   /* Initialize COM1 port (3000000, 8 bits (7-bit data + 1 stop bit), no parity */
@@ -449,6 +450,57 @@ static void MX_USB_PCD_Init(void)
 }
 
 /**
+  * @brief SPI4 Initialization Function
+  * @param None
+  * @retval None
+  * @note Hand-added (not CubeMX-regenerated) for the STM32 -> XIAO SPI bridge.
+  * Master, 8-bit, mode 0 (CPOL=0/CPHA=0) - matches spi_slave_interface_config_t's
+  * mode=0 in the XIAO's stm32_utility/spi/spi.ino. NSS is software-managed:
+  * SPI4_NSS_Pin is driven manually as a plain GPIO around each transfer (see
+  * send_vis_frame_spi() below), not by the SPI peripheral's own NSS hardware.
+  * BaudRatePrescaler: PCLK2 is 250MHz on this board (see SystemClock_Config -
+  * APB2CLKDivider=DIV1, HCLK=SYSCLK=250MHz). Temporarily dropped from /16
+  * (15.625MHz) to /128 (~1.95MHz) to test whether the XIAO's SPI slave was
+  * losing sync with CS at the higher rate (jumper-wire crosstalk from SCK onto
+  * the adjacent CS line is a known failure mode at double-digit MHz on
+  * unshielded wiring) - see the trans_len short-transfer diagnostic in the
+  * XIAO's stm32_utility/spi/spi.ino. Still far above the ~5.45Mbps this link
+  * needs at the current frame rate, so no visible throughput cost either way.
+  * Bump back toward /16 once frames are landing reliably, to see how far it
+  * can go before genuinely necessary. Re-check this comment if
+  * SystemClock_Config ever changes.
+  */
+static void MX_SPI4_Init(void)
+{
+  hspi4.Instance = SPI4;
+  hspi4.Init.Mode = SPI_MODE_MASTER;
+  hspi4.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi4.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi4.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi4.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi4.Init.NSS = SPI_NSS_SOFT;
+  hspi4.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi4.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi4.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi4.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi4.Init.CRCPolynomial = 0x7;
+  hspi4.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  hspi4.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
+  hspi4.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
+  hspi4.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
+  hspi4.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
+  hspi4.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
+  hspi4.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
+  hspi4.Init.IOSwap = SPI_IO_SWAP_DISABLE;
+  hspi4.Init.ReadyMasterManagement = SPI_RDY_MASTER_MANAGEMENT_INTERNALLY;
+  hspi4.Init.ReadyPolarity = SPI_RDY_POLARITY_HIGH;
+  if (HAL_SPI_Init(&hspi4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -486,6 +538,11 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(DEBUG_GPIO_2_GPIO_Port, DEBUG_GPIO_2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level - hand-added: SPI4_NSS idles high (deselected,
+   * active-low CS to the XIAO) before its pin mode below switches it to an output,
+   * same ordering CubeMX already uses for the other output pins in this function */
+  HAL_GPIO_WritePin(SPI4_NSS_GPIO_Port, SPI4_NSS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin : USER_BUTTON_Pin */
   GPIO_InitStruct.Pin = USER_BUTTON_Pin;
@@ -584,7 +641,24 @@ static void MX_GPIO_Init(void)
   HAL_NVIC_EnableIRQ(EXTI7_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* Hand-added (not CubeMX-regenerated): STM32 -> XIAO SPI bridge control lines.
+   * SPI4_SCK/MISO/MOSI (PE12/13/14) are configured separately in
+   * HAL_SPI_MspInit() (stm32h5xx_hal_msp.c), same as every other peripheral's AF
+   * pins in this project - only the two plain-GPIO control lines belong here. */
 
+  /*Configure GPIO pin : SPI4_NSS_Pin - software-managed chip select to the XIAO */
+  GPIO_InitStruct.Pin = SPI4_NSS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(SPI4_NSS_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : XIAO_READY_Pin - input from the XIAO; pulled down so an
+   * unpowered/disconnected XIAO reads as "not ready" instead of floating */
+  GPIO_InitStruct.Pin = XIAO_READY_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(XIAO_READY_GPIO_Port, &GPIO_InitStruct);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 

@@ -77,7 +77,7 @@
 /*#define HAL_MMC_MODULE_ENABLED */
 /*#define HAL_SMARTCARD_MODULE_ENABLED */
 /*#define HAL_SMBUS_MODULE_ENABLED */
-/*#define HAL_SPI_MODULE_ENABLED */
+#define HAL_SPI_MODULE_ENABLED /* hand-enabled for the STM32 -> XIAO SPI bridge, see MX_SPI4_Init() in main.c */
 /*#define HAL_SRAM_MODULE_ENABLED */
 #define HAL_TIM_MODULE_ENABLED
 /*#define HAL_RAMCFG_MODULE_ENABLED */
