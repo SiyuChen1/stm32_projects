@@ -1194,9 +1194,10 @@ output on/off, frame/error/rollback counters, active protocol state and live
 profiler UART printing is off, because the status page needs those measurements and reading DWT
 timestamps has negligible cost.
 
-The HTTP interface is `GET /status`, `POST /control/safe`, `POST /control/link` and
-`POST /control/abort`; the inlined webpage calls these directly. Link changes are protected by the
-commit/revert handshake instead of being applied unilaterally. Image selection is a real transport
+The control interface on port 80 is `GET /status`, `POST /control/safe`, `POST /control/link` and
+`POST /control/abort`; the persistent binary image response is `GET /stream.bin` on port 81, with
+`GET /frame.bin` on port 80 retained as an automatic fallback. The inlined webpage calls these
+directly. Link changes are protected by the commit/revert handshake instead of being applied unilaterally. Image selection is a real transport
 choice, not merely a canvas visibility toggle: the STM32 omits the unselected arrays, the SPI chunk
 count falls accordingly, and the XIAO/browser parse the matching self-describing packet.
 
@@ -1248,19 +1249,24 @@ the browser/Wi-Fi path after SPI starvation itself had been removed:
 
 1. ESP32 station modem sleep periodically turns off RF/PHY/baseband and can add a DTIM/listen-cycle
    delay. The live viewer now disables Wi-Fi sleep; this spends more power to minimize latency.
-2. The browser asked for frames faster than the STM32 produced them. `WebServer` closes each HTTP
-   connection, so unchanged 22 KB frames and extra TCP setup were needless work. `/frame.bin?after=N`
-   now short-long-polls for a newer counter, returns `204` when unchanged, and never queues old frames.
-3. A slow `fetch()` could wait indefinitely. Both the XIAO socket write and browser image request now
-   time out after 750 ms, after which the browser starts a fresh latest-frame request; the UI reports
-   XIAO snapshot age plus HTTP transfer time instead of asking the user to infer latency from FPS.
+2. The browser asked for frames faster than the STM32 produced them, and Arduino `WebServer` closes
+   every response. The primary path is now one chunked HTTP response on port 81: each record contains
+   a 16-byte `V9FR` header and one unchanged `VL5?` packet. TCP setup and HTTP parsing happen once per
+   viewer session, not once per frame.
+3. The stream is latest-only. If a socket write is slow, the XIAO copies the newest snapshot after it
+   completes and counts the intervening publications as skipped; it never queues old images. A write
+   taking 750 ms disconnects the client, while the browser reconnects automatically and falls back to
+   `/frame.bin?after=N` after three failures. A 1.5-second no-data watchdog also breaks dead streams.
+   One persistent viewer is supported; additional pages fall back to the port-80 request path until
+   the stream connection becomes available.
 4. The colour mapper returned a new three-element JavaScript array for every coloured pixel. At
    54 x 42, two colour planes and 12 fps that exceeded 50,000 temporary arrays/s, causing periodic
    garbage-collector pauses. It now writes directly into persistent per-canvas `ImageData` buffers.
 
-The XIAO status/log adds last and maximum HTTP send time, making the next capture diagnostic: stable
-XIAO FPS with HTTP maxima spiking isolates Wi-Fi/TCP delivery, while falling XIAO FPS or growing
-short/CRC counters still points to SPI.
+The browser incrementally parses arbitrary TCP chunk boundaries into one fixed reusable buffer. The
+XIAO status/log reports stream connected state, last/maximum send time, skipped publications and
+disconnects. Stable XIAO FPS with stream send maxima or skips growing isolates Wi-Fi/TCP delivery,
+while falling XIAO FPS or growing short/CRC counters still points to SPI.
 
 ### Why divider 8/2 and chunk 4086 fail
 
