@@ -743,6 +743,34 @@ to be the real problem.
 see the firmware's raw text traces without a debugger. Check baud match between `main.c` and the
 visualizer's `-b` flag (5.2).
 
+**K. A whole project's files vanish from disk, but `.project` is still there** - STM32CubeIDE's
+right-click **Delete** (Delete Resources wizard) with "delete project contents on disk" removes
+everything, then Eclipse notices the project is still registered in the workspace and **auto-creates
+a stub `.project`**. The single surviving file is therefore *not* a survivor - it is a freshly
+generated replacement, and it has a newer mtime than everything around it.
+
+This happened here to `STM32CubeIDE/workspace_1.13.2/UART XIAO ESP32S3/`: 118 files deleted, 1 stub
+left. Nothing warns you; it only surfaced as deletions in `git status`.
+
+Confirm the cause in the workspace log:
+
+```bash
+grep -iE "DeleteResourceAction|DeleteResourcesWizard|project description file" \
+  STM32CubeIDE/workspace_1.13.2/.metadata/.log
+```
+
+A `Save operation warnings` entry saying *"The project description file (.project) for 'X' was
+missing. A new project description file has been created"* pins the exact timestamp.
+
+Recover with git - the files were only gone from disk, never from history:
+
+```bash
+git checkout -- "STM32CubeIDE/workspace_1.13.2/UART XIAO ESP32S3/"
+```
+
+**Do not commit such a deletion without checking this first.** Committing it would also have kept the
+auto-generated stub `.project` and discarded the real one.
+
 ---
 
 # 10. Command Reference
@@ -1096,3 +1124,49 @@ simpler with 1 chunk than with 12.
 `bypass-refl-filter`, `bypass-r2p-algo`, `bypass-r2p-filter` (all default to off, i.e. every stage
 runs). Profile the individual stages before disabling any. Dropping to binning 4 (27x21) quarters the
 pixel count and would approach 30 fps, at half the spatial resolution.
+
+## 14.6 Is 16 fps "correct"? What ST does and does not publish
+
+Searched for independent confirmation of the 16 fps figure. **There is no published number to compare
+against**, so record the status honestly rather than treating 16 fps as an ST specification:
+
+- **ST publishes no end-to-end fps figure** for VL53L9CX postprocessing on any host MCU - not in
+  UM3656 (X-CUBE-53L9A1), UM3657 (X-NUCLEO-53L9A1), or either data brief. They describe the
+  middleware only qualitatively ("calibration, normalization, optical corrections, noise removal,
+  confidence").
+- **No community reports.** Nothing on community.st.com about frame rate for this combination.
+- **The widely quoted "100 Hz" is the sensor module's own raw frame rate**, not host throughput. Same
+  category of confusion as `FPS_TO_FRAME_PERIOD(30)` in the profile table being the *acquisition*
+  period. Neither is a claim about what an STM32 can postprocess.
+- **Circumstantial support:** ST's own evaluation platform for this sensor is the STEVAL-VL53L9,
+  which targets NUCLEO-N657X0-Q / STM32N6570-DK - a Cortex-M55 at 800 MHz with an NPU. That ST built
+  a separate board on far heavier silicon for the same sensor is consistent with 16 fps being what a
+  Cortex-M33 at 250 MHz delivers. Suggestive, not proof.
+
+**What is solid:** ST's own unmodified prebuilt binary measured 16 fps on this exact hardware
+(X-NUCLEO-53L9A1 + NUCLEO-H563ZI, the officially documented configuration), and that independently
+matches this project's instrumented `acquire + transform + readout` = 61 ms. First-party measurement
+on documented hardware, but **unverified by third parties** - if certainty matters, ask on
+community.st.com quoting the 61 ms breakdown, since nobody appears to have.
+
+## 14.7 Planned: ESP32-S3 as a runtime control panel
+
+Every experiment in Section 14 cost a reflash-and-recapture cycle. Moving configuration to the
+XIAO's webpage would collapse that: the bisection that found the SCK fault, the clock sweep and the
+chunk-size question could all have been done from a browser in minutes.
+
+**Transport:** the MISO line is currently unused - the STM32 clocks 22 KB out on MOSI every frame and
+reads nothing back. A small control struct returned during the same transaction costs no extra
+transactions and no new wires.
+
+**Worth exposing:** SPI clock divider, chunk size/count, `CONF_STREAM_VISUALIZER` on/off, UART baud,
+the seven transform bypasses, binning/profile, profiler on/off - plus live display of the `PROFILE`
+timings so the fps effect of each change is immediately visible.
+
+**The hazard:** some of these are *wire-protocol* values (chunk size above all). Changing one
+unilaterally desyncs the link. Those need propose -> both sides commit at a frame boundary -> verify,
+with automatic revert if frames stop validating. Otherwise a bad setting from the browser bricks the
+link until a reflash - exactly the pain this is meant to remove.
+
+**Suggested order:** read-only status page (timings, counters - zero risk) -> safe knobs (transform
+bypasses, UART on/off, profiler) -> protocol-affecting knobs behind the commit/revert handshake.
