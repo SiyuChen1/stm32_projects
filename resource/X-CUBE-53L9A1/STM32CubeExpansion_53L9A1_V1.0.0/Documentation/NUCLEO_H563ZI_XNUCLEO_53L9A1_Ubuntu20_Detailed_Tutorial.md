@@ -892,11 +892,13 @@ SPI has no built-in framing and a slave cannot produce data on demand mid-transa
 buffer must be queued *before* the master clocks. Three separate mistakes were made here before it
 worked; all three are worth understanding because each produced a different, misleading symptom.
 
-**A frame is sent as 12 chunks of 2048 bytes** (`SPI_CHUNK_BYTES`), padded to 24576, not as one
-22692-byte transaction. This is a **wire-protocol constant - change it on both sides and reflash both
-together.** (Chunking is not strictly required: with DMA, ESP-IDF bounds slave transfers only by
-internal memory. It was introduced while chasing a symptom whose real cause was the SCK wiring, and
-it costs ~14ms/frame in handshake round-trips. It does buy per-chunk verification and resync points.)
+**The production default is all three images in 12 chunks of 2048 bytes**, padded to 24576, not one
+22692-byte transaction. Protocol v2 can instead send depth, amplitude or ambient alone, and can
+select 512, 1024, 2048 or 4092 bytes per chunk. Both peers change the selected image set, chunk size
+and clock only after the frame-boundary handshake in Section 11.2.1. At 54 x 42 and 2048-byte chunks,
+all three images need 12 transactions, depth alone needs 3, and amplitude or ambient alone needs 5.
+Chunking buys regular CS resynchronization points, but the old fixed all-plane implementation cost
+about 14 ms/frame in handshake round-trips.
 
 **READY must be driven from the SPI driver's ISR callbacks, never from `loop()`:**
 
@@ -911,12 +913,13 @@ it costs ~14ms/frame in handshake round-trips. It does buy per-chunk verificatio
   the transaction end), *then* HIGH (slave re-armed). A level-only wait cannot tell stale from fresh.
 
 **The receiver must find the frame boundary itself.** The transport carries no chunk index - a frame
-is just 12 identical transactions - so the receiver cannot tell chunk 0 from chunk 7. It almost always
+is a negotiated number of identical transactions - so the receiver cannot tell chunk 0 from chunk 7.
+It almost always
 starts listening mid-frame (the STM32 is already streaming when the XIAO boots), and treating the
 first chunk seen as chunk 0 locks assembly to a constant wrong offset *forever*: the tail of one frame
 reassembled with the head of the next, header landing mid-buffer. Chunk 0 is self-identifying because
-the `"VL59"` header sits at its offset 0, so the receiver refuses to assemble until a chunk starts
-with the magic, and re-anchors to chunk 0 whenever it sees the magic. That second rule also recovers
+one of the `"VL5?"` headers sits at its offset 0, so the receiver refuses to assemble until a chunk
+starts with a recognized magic, and re-anchors to chunk 0 whenever it sees one. That second rule also recovers
 from the master abandoning a frame part-way on a READY timeout and restarting at chunk 0.
 
 **Always check `trans_len`.** `spi_slave_get_trans_result() == ESP_OK` means only that CS toggled - it
@@ -925,6 +928,31 @@ DMA buffer, which reads as plausible repeating garbage. Zero the buffer between 
 
 *Generalizable:* any protocol that splits a frame across several equal fixed-size transfers needs
 either a chunk index or a self-identifying first chunk. Length alone is not framing.
+
+### 11.2.1 Full-duplex runtime control and rollback
+
+Protocol v2 keeps the original all-image packet compatible and adds single-image layouts. The four
+magics make the payload self-describing: `VL59` is amplitude + depth + ambient, `VL5A` is amplitude,
+`VL5D` is depth and `VL5I` is ambient. Plane order in `VL59` remains amplitude, depth, ambient. The
+control plane uses the same full-duplex transfers:
+
+- XIAO -> STM32 (MISO): a 26-byte `rc_command_t` at the beginning of every chunk. It has `"V9CT"`
+  magic, protocol version, monotonically increasing sequence, requested settings and CRC-16.
+- STM32 -> XIAO (MOSI): a 58-byte `rc_status_t` immediately after the selected image payload. It has
+  `"V9ST"` magic, version, acknowledgement/error, active settings (including the plane mask), link
+  state, counters and all seven stage timings, again protected by CRC-16.
+
+Repeating the command in every chunk makes loss of any one chunk harmless; the STM32 applies each
+sequence only once. Status is naturally one frame behind because the master constructs the MOSI
+frame before it receives that frame's MISO command.
+
+Chunk size, SPI divider and selected image set use `PROPOSE -> PREPARED -> COMMIT ->
+SWITCH_AFTER_FRAME -> VERIFYING -> STABLE`. `SWITCH_AFTER_FRAME` is sent using the old framing. The
+XIAO parses it after the final old chunk and resizes the next queued transaction; the STM32 switches
+after completing that same frame. Both sides keep the last stable configuration. The STM32 reverts
+if verification does not arrive in ten frames, while the XIAO independently reverts after four
+seconds without completing the handshake. Thus a bad browser setting does not require either board
+to be reflashed.
 
 ## 11.3 Build gotcha: SPI wasn't wired into this project before
 
@@ -1045,8 +1073,9 @@ Recorded so they are not re-tried:
 - **"GPIO-matrix routing is too slow."** No - at 80 MHz and below it behaves identically to IO_MUX.
 - **"The clock is too fast."** No - ÷128 (1.95 MHz) was verified in the flashed ELF by disassembly,
   and ESP32 slaves handle up to 60 MHz.
-- **"HTTP serving starves the SPI loop."** No - measured identical 4.7 fps and zero bad frames with
-  the browser open and closed.
+- **"Any HTTP serving necessarily starves SPI."** No - the earlier read-only page measured identical
+  4.7 fps with the browser open and closed. A later synchronous control UI did introduce exactly this
+  starvation regression; Section 14.8 distinguishes the implementation bug from an inherent limit.
 - **"The IDE is flashing a stale binary."** No - the workspace tree predated features the chip
   demonstrably had. The IDE builds the *bundled* tree, the same `Debug/` that `make` writes to.
 - **Wiring was questioned four times after being confirmed.** It was correct relative to the
@@ -1149,24 +1178,101 @@ matches this project's instrumented `acquire + transform + readout` = 61 ms. Fir
 on documented hardware, but **unverified by third parties** - if certainty matters, ask on
 community.st.com quoting the 61 ms breakdown, since nobody appears to have.
 
-## 14.7 Planned: ESP32-S3 as a runtime control panel
+## 14.7 Implemented: ESP32-S3 runtime control panel
 
-Every experiment in Section 14 cost a reflash-and-recapture cycle. Moving configuration to the
-XIAO's webpage would collapse that: the bisection that found the SCK fault, the clock sweep and the
-chunk-size question could all have been done from a browser in minutes.
+Every experiment in Section 14 used to cost a reflash-and-recapture cycle. The XIAO webpage now
+provides live STM32 status and runtime controls at `http://<xiao-ip>/`.
 
-**Transport:** the MISO line is currently unused - the STM32 clocks 22 KB out on MOSI every frame and
-reads nothing back. A small control struct returned during the same transaction costs no extra
-transactions and no new wires.
+**Transport:** SPI4 now uses `HAL_SPI_TransmitReceive()`. The XIAO fills MISO with the versioned
+command described in Section 11.2.1 while it receives the image on MOSI, so control adds no
+transactions and no wires. STM32 status occupies the previously padded MOSI tail.
 
-**Worth exposing:** SPI clock divider, chunk size/count, `CONF_STREAM_VISUALIZER` on/off, UART baud,
-the seven transform bypasses, binning/profile, profiler on/off - plus live display of the `PROFILE`
-timings so the fps effect of each change is immediately visible.
+**Exposed now:** all three images or one selected image, SPI divider, chunk size/count, UART image
+stream on/off, UART baud, all seven transform bypasses, same-binning ranging profile, profiler UART
+output on/off, frame/error/rollback counters, active protocol state and live
+`acquire/transform/readout/print/UART/SPI/total` timings. Timing collection remains active even when
+profiler UART printing is off, because the status page needs those measurements and reading DWT
+timestamps has negligible cost.
 
-**The hazard:** some of these are *wire-protocol* values (chunk size above all). Changing one
-unilaterally desyncs the link. Those need propose -> both sides commit at a frame boundary -> verify,
-with automatic revert if frames stop validating. Otherwise a bad setting from the browser bricks the
-link until a reflash - exactly the pain this is meant to remove.
+The HTTP interface is `GET /status`, `POST /control/safe`, `POST /control/link` and
+`POST /control/abort`; the inlined webpage calls these directly. Link changes are protected by the
+commit/revert handshake instead of being applied unilaterally. Image selection is a real transport
+choice, not merely a canvas visibility toggle: the STM32 omits the unselected arrays, the SPI chunk
+count falls accordingly, and the XIAO/browser parse the matching self-describing packet.
 
-**Suggested order:** read-only status page (timings, counters - zero risk) -> safe knobs (transform
-bypasses, UART on/off, profiler) -> protocol-affecting knobs behind the commit/revert handshake.
+The page is a responsive, dependency-free control room rather than a wide debug form. It separates
+producer, receiver and browser frame rates, shows a stage-time budget, and explains the physical or
+algorithmic meaning of every image, link option, profile, bypass, UART and profiler control beside
+the setting itself.
+
+**Binning caveat:** the current transform is prepared for binning 2 (54x42). Profiles 0 and 1 can be
+switched live because they share that geometry. Profiles 2 and 3 use binning 4 and require rebuilding
+the raw buffers and transform capabilities; the STM32 returns
+`RC_ERROR_PROFILE_RESTART_REQUIRED` rather than applying an unsafe cross-binning change. The browser
+labels those choices `rebuild` so this is visible before applying them.
+
+## 14.8 Control-UI FPS regression and fix
+
+No new STM32 serial log was recorded for this incident. The diagnosis uses `xiao_new_ui.log`, the
+browser screenshot and code inspection. The XIAO log spends long intervals with `good=0` while the
+partial `chunk_idx` advances slowly, then receives a burst of complete frames. Bad-frame and CRC
+counters stay near zero. The screenshot also reports `fetch failed`, while the STM32 status embedded
+in earlier valid frames reports about 11 fps. This pattern is receiver servicing latency, not evidence
+of corrupted MOSI data or a new STM32-side timing measurement.
+
+The regression had two compounding causes:
+
+1. `WebServer::sendContent()` synchronously wrote a roughly 22 KB response from the same cooperative
+   Arduino `loop()` that drained `spi_slave_get_trans_result()` and queued the next slave transfer.
+   During a slow Wi-Fi response, the XIAO did not re-arm SPI; the STM32 correctly waited on READY, so
+   acquisition appeared to fall to 2-3 fps and then burst upward when HTTP returned.
+2. The page used `setInterval()` for asynchronous frame requests. A request taking longer than the
+   interval did not delay the next callback, so multiple fetches could accumulate and prolong the
+   blocked period. Instantaneous `1000 / last-frame-gap` reporting exaggerated both the low and high
+   ends of the burst pattern.
+
+The XIAO now services SPI in a dedicated, higher-priority FreeRTOS task pinned to the Arduino core.
+On the dual-core S3 this leaves core 0 available to the Wi-Fi/IP stack. A validated frame is copied
+under a short mutex into a latest-frame snapshot; HTTP copies that snapshot to its own buffer and
+releases the mutex before sending, so a slow browser cannot prevent the next SPI transaction from
+being queued. Browser polling is self-scheduled only after the previous fetch completes, and both
+XIAO receive FPS and browser render FPS use rolling windows. These changes remove the software
+starvation path; flash both protocol-v2 firmwares and capture a fresh XIAO log to validate the result
+on the actual Wi-Fi channel and wiring.
+
+## 14.9 Constant FPS but periodically delayed browser rendering
+
+Throughput and latency are different measurements: the STM32, XIAO and browser can each report 12
+frames/s while the displayed frame periodically arrives late. Code inspection found four sources in
+the browser/Wi-Fi path after SPI starvation itself had been removed:
+
+1. ESP32 station modem sleep periodically turns off RF/PHY/baseband and can add a DTIM/listen-cycle
+   delay. The live viewer now disables Wi-Fi sleep; this spends more power to minimize latency.
+2. The browser asked for frames faster than the STM32 produced them. `WebServer` closes each HTTP
+   connection, so unchanged 22 KB frames and extra TCP setup were needless work. `/frame.bin?after=N`
+   now short-long-polls for a newer counter, returns `204` when unchanged, and never queues old frames.
+3. A slow `fetch()` could wait indefinitely. Both the XIAO socket write and browser image request now
+   time out after 750 ms, after which the browser starts a fresh latest-frame request; the UI reports
+   XIAO snapshot age plus HTTP transfer time instead of asking the user to infer latency from FPS.
+4. The colour mapper returned a new three-element JavaScript array for every coloured pixel. At
+   54 x 42, two colour planes and 12 fps that exceeded 50,000 temporary arrays/s, causing periodic
+   garbage-collector pauses. It now writes directly into persistent per-canvas `ImageData` buffers.
+
+The XIAO status/log adds last and maximum HTTP send time, making the next capture diagnostic: stable
+XIAO FPS with HTTP maxima spiking isolates Wi-Fi/TCP delivery, while falling XIAO FPS or growing
+short/CRC counters still points to SPI.
+
+### Why divider 8/2 and chunk 4086 fail
+
+SPI4 is clocked from 250 MHz: divider 16 is 15.625 MHz, divider 8 is 31.25 MHz and divider 2 is
+125 MHz. Espressif specifies the S3 general-purpose SPI slave for at most 60 MHz under suitable clock
+duty cycle and signal conditions. Divider 2 is therefore invalid outright; divider 4 is slightly
+above that ceiling. Divider 8 is below the silicon headline limit but failed on this complete
+full-duplex path, which includes XIAO pin routing, MISO response timing, jumper-wire loading and the
+STM32 input setup time. The runtime UI and both validators now accept divider 16 or slower.
+
+The largest supported chunk is **4092**, not 4086. DMA transfer lengths must be multiples of four;
+4092 is divisible by four and matches the configured XIAO DMA maximum, while 4086 is rejected. For a
+performance test, change only chunk size to 4092 while leaving divider 16, verify stable frames, and
+only then compare timings. Changing size and clock together makes a rollback unable to identify which
+dimension failed.

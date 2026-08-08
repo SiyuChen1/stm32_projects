@@ -26,6 +26,7 @@
 #include "vl53l9_interface.h"
 #include "vl53l9_transform.h"
 #include "vl53l9_utils.h"
+#include "runtime_control.h"
 
 /* USER CODE BEGIN Includes */
 #include "stm32h5xx_nucleo.h" /* hcom_uart[], COM1, HAL_UART_Transmit - used to stream binary frames to the PC */
@@ -129,26 +130,27 @@ static void handle_error_impl(int line);
  */
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len, uint16_t crc);
 #endif
-#if CONF_STREAM_VISUALIZER
+#if CONF_STREAM_VISUALIZER || CONF_STREAM_SPI
 static void send_vis_frame(uint32_t frame_counter, uint8_t width, uint8_t height, const float *amplitude,
                             const float *depth, const float *ambient);
 #endif
 #if CONF_STREAM_SPI
 /**
- * @brief SPI has no built-in framing, so every transaction is this fixed length regardless of the
- * frame's actual width*height (see the handshake/padding note in send_vis_frame_spi()). Matches
- * SPI_FRAME_BYTES in the XIAO's spi.ino exactly - 12 (header) + 2268 * (4+2+4) = 22692 bytes.
+ * @brief Maximum image storage for the all-plane format. The active payload can be smaller when
+ * one plane is selected; the negotiated chunk count includes that payload plus the status trailer.
+ * Matches SPI_FRAME_BYTES in the XIAO's spi.ino exactly:
+ * 12 (header) + 2268 * (4+2+4) = 22692 bytes.
  */
 #define SPI_FRAME_BYTES (sizeof(vis_frame_header_t) + VIS_MAX_PLANE_PIXELS * (sizeof(float) + sizeof(uint16_t) + sizeof(float)))
-/* A frame goes out as SPI_CHUNK_COUNT separate transactions, each its own CS assert + READY
- * handshake, rather than one 22692-byte transfer. Espressif's SPI slave docs note the receiver
+/* A frame goes out as several transactions, each its own CS assert + READY handshake, rather than
+ * one 22692-byte transfer. The boot-safe default is 12 x 2048; runtime control negotiates other
+ * supported sizes at a frame boundary. Espressif's SPI slave docs note the receiver
  * "cannot recognize or receive data correctly if the clock is too fast", and that hosts should
  * write lengths that are multiples of 4 bytes. Empirically a single full-frame transaction died
  * ~4000 bits in, at bit counts that were NOT multiples of 8 - a master cannot clock a partial
  * byte, so the slave was dropping SCK edges and losing sync mid-transaction. Chunking gives it a
  * clean CS resync point 12x per frame and lets the receiver verify each piece independently.
- * Must match SPI_CHUNK_BYTES in the XIAO's spi.ino exactly - wire-protocol constant, so both
- * sides must be reflashed together when it changes. */
+ * Both peers keep the last stable chunk size and revert independently if verification fails. */
 /* DIAGNOSTIC MODE. Set to 1 to send a known byte ramp instead of real sensor data: every chunk is
  * filled so that byte k of the whole padded frame == (k & 0xFF). The XIAO has a matching flag and
  * checks each received chunk against that ramp, reporting the first mismatching offset. This takes
@@ -183,9 +185,8 @@ static void send_vis_frame(uint32_t frame_counter, uint8_t width, uint8_t height
  * link is sound and the fault is size/timing dependent, and the size can be walked back up to find
  * the breaking point. If even this fails, the fault is fundamental and independent of both. */
 #define SPI_TEST_BYTES (64)
-#define SPI_CHUNK_BYTES (2048)
-#define SPI_CHUNK_COUNT ((SPI_FRAME_BYTES + SPI_CHUNK_BYTES - 1) / SPI_CHUNK_BYTES) /* 12 */
-#define SPI_PADDED_FRAME_BYTES (SPI_CHUNK_COUNT * SPI_CHUNK_BYTES)                  /* 24576 */
+#define SPI_DEFAULT_CHUNK_BYTES (2048U)
+#define SPI_MAX_PADDED_FRAME_BYTES (24576U)
 #define SPI_READY_TIMEOUT_MS (200)   /**< how long to wait for the XIAO's READY handshake before skipping this frame */
 /* ~92.9ms of actual transfer at the current 1.95MHz (SPI_BAUDRATEPRESCALER_128) SCK - was 100ms
  * (a ~7% margin, not "generous") until this got caught: I dropped the clock 8x when testing a
@@ -284,6 +285,244 @@ static bool spi_wait_ready(GPIO_PinState level) {
 static void send_vis_frame_spi(uint32_t frame_counter, uint8_t width, uint8_t height, const float *amplitude,
                                 const float *depth, const float *ambient);
 #endif
+
+/* Runtime state is deliberately initialized to the exact production settings that were already
+ * proven stable.  The control plane can therefore be flashed on one side at a time without silently
+ * changing clock speed, frame layout, UART traffic, or transform output. */
+static rc_status_t g_rc_status = {
+    .version = RC_PROTOCOL_VERSION,
+    .link_state = RC_LINK_STABLE,
+    .flags = (CONF_STREAM_VISUALIZER ? RC_FLAG_UART_STREAM : 0U) |
+             (CONF_PROFILE_TIMING ? RC_FLAG_PROFILER : 0U),
+    .chunk_bytes = SPI_DEFAULT_CHUNK_BYTES,
+    .chunk_count = 12U,
+    .spi_prescaler = 16U,
+    .profile = CONF_USECASE,
+    .binning = 2U,
+    .plane_mask = RC_PLANE_ALL,
+    .uart_baud = 3000000U,
+    .spi_hz = 15625000U,
+};
+static rc_command_t g_pending_safe;
+static bool g_have_pending_safe = false;
+static uint16_t g_proposed_chunk_bytes = SPI_DEFAULT_CHUNK_BYTES;
+static uint16_t g_proposed_prescaler = 16U;
+static uint8_t g_proposed_plane_mask = RC_PLANE_ALL;
+static uint16_t g_stable_chunk_bytes = SPI_DEFAULT_CHUNK_BYTES;
+static uint16_t g_stable_prescaler = 16U;
+static uint8_t g_stable_plane_mask = RC_PLANE_ALL;
+static uint32_t g_verify_deadline_frame = 0U;
+
+static bool valid_plane_mask(uint8_t mask) {
+    return (mask == RC_PLANE_ALL) || (mask == RC_PLANE_AMPLITUDE) ||
+           (mask == RC_PLANE_DEPTH) || (mask == RC_PLANE_AMBIENT);
+}
+
+static size_t spi_payload_bytes(uint8_t plane_mask) {
+    size_t bytes = sizeof(vis_frame_header_t);
+    if ((plane_mask & RC_PLANE_AMPLITUDE) != 0U) {
+        bytes += VIS_MAX_PLANE_PIXELS * sizeof(float);
+    }
+    if ((plane_mask & RC_PLANE_DEPTH) != 0U) {
+        bytes += VIS_MAX_PLANE_PIXELS * sizeof(uint16_t);
+    }
+    if ((plane_mask & RC_PLANE_AMBIENT) != 0U) {
+        bytes += VIS_MAX_PLANE_PIXELS * sizeof(float);
+    }
+    return bytes;
+}
+
+static uint16_t spi_chunk_count(uint16_t chunk_bytes, uint8_t plane_mask) {
+    size_t controlled_bytes = spi_payload_bytes(plane_mask) + sizeof(rc_status_t);
+    return (uint16_t)((controlled_bytes + chunk_bytes - 1U) / chunk_bytes);
+}
+
+static bool valid_chunk_bytes(uint16_t bytes) {
+    return (bytes == 512U) || (bytes == 1024U) || (bytes == 2048U) || (bytes == 4092U);
+}
+
+static uint32_t hal_prescaler_value(uint16_t divider) {
+    switch (divider) {
+        case 2U: return SPI_BAUDRATEPRESCALER_2;
+        case 4U: return SPI_BAUDRATEPRESCALER_4;
+        case 8U: return SPI_BAUDRATEPRESCALER_8;
+        case 16U: return SPI_BAUDRATEPRESCALER_16;
+        case 32U: return SPI_BAUDRATEPRESCALER_32;
+        case 64U: return SPI_BAUDRATEPRESCALER_64;
+        case 128U: return SPI_BAUDRATEPRESCALER_128;
+        case 256U: return SPI_BAUDRATEPRESCALER_256;
+        default: return 0U;
+    }
+}
+
+static bool valid_spi_prescaler(uint16_t divider) {
+    /* SPI4 runs from 250 MHz. /16 (15.625 MHz) is the fastest setting validated on the complete
+     * full-duplex XIAO/jumper-wire path. /8 failed link verification on this hardware, while /4
+     * and /2 approach or exceed the ESP32-S3 slave's specified maximum. */
+    return (divider == 16U) || (divider == 32U) || (divider == 64U) ||
+           (divider == 128U) || (divider == 256U);
+}
+
+static bool apply_spi_link(uint16_t chunk_bytes, uint16_t prescaler, uint8_t plane_mask) {
+    uint32_t hal_prescaler = hal_prescaler_value(prescaler);
+    if (!valid_chunk_bytes(chunk_bytes) || !valid_plane_mask(plane_mask) ||
+        !valid_spi_prescaler(prescaler) || (hal_prescaler == 0U)) {
+        return false;
+    }
+    if (HAL_SPI_DeInit(&hspi4) != HAL_OK) {
+        return false;
+    }
+    hspi4.Init.BaudRatePrescaler = hal_prescaler;
+    if (HAL_SPI_Init(&hspi4) != HAL_OK) {
+        return false;
+    }
+    g_rc_status.chunk_bytes = chunk_bytes;
+    g_rc_status.chunk_count = spi_chunk_count(chunk_bytes, plane_mask);
+    g_rc_status.spi_prescaler = prescaler;
+    g_rc_status.spi_hz = 250000000U / prescaler;
+    g_rc_status.plane_mask = plane_mask;
+    return true;
+}
+
+static bool valid_uart_baud(uint32_t baud) {
+    return (baud == 115200U) || (baud == 460800U) || (baud == 921600U) ||
+           (baud == 2000000U) || (baud == 3000000U);
+}
+
+static void apply_pending_safe_controls(transform_t *p_transform, vl53l9_device_t *p_dev) {
+    if (!g_have_pending_safe) {
+        return;
+    }
+    rc_command_t command = g_pending_safe;
+    g_have_pending_safe = false;
+    g_rc_status.error = RC_ERROR_NONE;
+
+    if (!valid_uart_baud(command.uart_baud) || command.profile >= VL53L9_NB_USECASES) {
+        g_rc_status.error = RC_ERROR_BAD_VALUE;
+        return;
+    }
+
+    /* Cross-binning changes alter both the raw input size and every prepared output capability.
+     * Reject them explicitly; applying them to the live pipeline would overrun/misinterpret buffers. */
+    vl53l9_profile_t *requested_profile = &g_ranging_profiles[command.profile];
+    if (requested_profile->binning != g_rc_status.binning) {
+        g_rc_status.error = RC_ERROR_PROFILE_RESTART_REQUIRED;
+        return;
+    }
+
+    static const char *const bypass_names[7] = {
+        "bypass-r2p-algo", "bypass-tnr-algo", "bypass-r2p-filter", "bypass-conf-filter",
+        "bypass-refl-filter", "bypass-sharpener-filter", "bypass-fp-filter",
+    };
+    for (uint8_t i = 0; i < 7U; i++) {
+        int ret = transform_set_control(p_transform, bypass_names[i],
+                                        (value_t){ .val.v_bool = ((command.bypass_mask >> i) & 1U) != 0U,
+                                                   .tid = VTID_BOOL });
+        if (ret != 0) {
+            g_rc_status.error = RC_ERROR_APPLY_FAILED;
+            return;
+        }
+    }
+
+    if (command.profile != g_rc_status.profile) {
+        if ((vl53l9_stop(p_dev) != 0) || (vl53l9_utils_set_profile(p_dev, requested_profile) != 0) ||
+            (vl53l9_set_sync_mode(p_dev, VL53L9_SYNC_MANUAL) != 0) || (vl53l9_start(p_dev) != 0)) {
+            g_rc_status.error = RC_ERROR_APPLY_FAILED;
+            return;
+        }
+        platform_acknowledge_event(PLATFORM_GPIO_IT_EVT);
+        g_rc_status.profile = command.profile;
+    }
+
+    if (command.uart_baud != g_rc_status.uart_baud) {
+        if (HAL_UART_DeInit(&hcom_uart[COM1]) != HAL_OK) {
+            g_rc_status.error = RC_ERROR_APPLY_FAILED;
+            return;
+        }
+        hcom_uart[COM1].Init.BaudRate = command.uart_baud;
+        if (HAL_UART_Init(&hcom_uart[COM1]) != HAL_OK) {
+            g_rc_status.error = RC_ERROR_APPLY_FAILED;
+            return;
+        }
+        g_rc_status.uart_baud = command.uart_baud;
+    }
+
+    g_rc_status.flags = command.flags & (RC_FLAG_UART_STREAM | RC_FLAG_PROFILER);
+    g_rc_status.bypass_mask = command.bypass_mask & 0x7FU;
+}
+
+static void process_runtime_command(const uint8_t *rx, size_t rx_len) {
+    static uint32_t last_sequence = 0U;
+    if (rx_len < sizeof(rc_command_t)) {
+        return;
+    }
+    rc_command_t command;
+    memcpy(&command, rx, sizeof(command));
+    if (memcmp(command.magic, RC_COMMAND_MAGIC, 4U) != 0 || command.version != RC_PROTOCOL_VERSION ||
+        crc16_ccitt((const uint8_t *)&command, offsetof(rc_command_t, crc16), 0U) != command.crc16) {
+        if (memcmp(command.magic, RC_COMMAND_MAGIC, 4U) == 0 && g_rc_status.command_crc_errors != UINT16_MAX) {
+            g_rc_status.command_crc_errors++;
+        }
+        return;
+    }
+    if (command.op == RC_OP_IDLE || command.sequence == last_sequence) {
+        return;
+    }
+    last_sequence = command.sequence;
+    g_rc_status.ack_sequence = command.sequence;
+    g_rc_status.error = RC_ERROR_NONE;
+
+    switch (command.op) {
+        case RC_OP_APPLY_SAFE:
+            g_pending_safe = command;
+            g_have_pending_safe = true;
+            break;
+        case RC_OP_PROPOSE_LINK:
+            if (!valid_chunk_bytes(command.chunk_bytes) || !valid_plane_mask(command.plane_mask) ||
+                !valid_spi_prescaler(command.spi_prescaler) ||
+                hal_prescaler_value(command.spi_prescaler) == 0U) {
+                g_rc_status.error = RC_ERROR_BAD_VALUE;
+                break;
+            }
+            g_proposed_chunk_bytes = command.chunk_bytes;
+            g_proposed_prescaler = command.spi_prescaler;
+            g_proposed_plane_mask = command.plane_mask;
+            g_rc_status.link_state = RC_LINK_PREPARED;
+            break;
+        case RC_OP_COMMIT_LINK:
+            if (g_rc_status.link_state != RC_LINK_PREPARED) {
+                g_rc_status.error = RC_ERROR_BAD_COMMAND;
+                break;
+            }
+            /* This state is advertised in the next old-layout frame. Both peers switch only after
+             * that complete frame, so the XIAO can resize its next queued transaction in time. */
+            g_rc_status.link_state = RC_LINK_SWITCH_AFTER_FRAME;
+            break;
+        case RC_OP_VERIFY_LINK:
+            if (g_rc_status.link_state != RC_LINK_VERIFYING) {
+                g_rc_status.error = RC_ERROR_BAD_COMMAND;
+                break;
+            }
+            g_stable_chunk_bytes = g_rc_status.chunk_bytes;
+            g_stable_prescaler = g_rc_status.spi_prescaler;
+            g_stable_plane_mask = g_rc_status.plane_mask;
+            g_rc_status.link_state = RC_LINK_STABLE;
+            break;
+        case RC_OP_ABORT_LINK:
+            if (g_rc_status.link_state == RC_LINK_VERIFYING) {
+                g_rc_status.link_state = RC_LINK_REVERT_AFTER_FRAME;
+            } else {
+                g_rc_status.link_state = RC_LINK_STABLE;
+                g_proposed_chunk_bytes = g_stable_chunk_bytes;
+                g_proposed_prescaler = g_stable_prescaler;
+                g_proposed_plane_mask = g_stable_plane_mask;
+            }
+            break;
+        default:
+            g_rc_status.error = RC_ERROR_BAD_COMMAND;
+            break;
+    }
+}
 
 void vl53l9_app() {
 
@@ -634,9 +873,11 @@ void vl53l9_app() {
 #if CONF_PROFILE_TIMING
             uint32_t t_before_uart = platform_profiler_get_timestamp();
 #endif
-#if CONF_STREAM_VISUALIZER
-            send_vis_frame(frame.p_metadata->frame_counter, out_width, out_height, (const float *)out_amp_mem.data,
-                            (const float *)out_depth_mem.data, (const float *)out_ambient_mem.data);
+#if CONF_STREAM_VISUALIZER || CONF_STREAM_SPI
+            if ((g_rc_status.flags & RC_FLAG_UART_STREAM) != 0U) {
+                send_vis_frame(frame.p_metadata->frame_counter, out_width, out_height, (const float *)out_amp_mem.data,
+                               (const float *)out_depth_mem.data, (const float *)out_ambient_mem.data);
+            }
 #endif
 #if CONF_PROFILE_TIMING
             uint32_t t_after_uart = platform_profiler_get_timestamp();
@@ -644,6 +885,7 @@ void vl53l9_app() {
 #if CONF_STREAM_SPI
             send_vis_frame_spi(frame.p_metadata->frame_counter, out_width, out_height, (const float *)out_amp_mem.data,
                                 (const float *)out_depth_mem.data, (const float *)out_ambient_mem.data);
+            apply_pending_safe_controls(p_transform, p_dev);
 #endif
 #if CONF_PROFILE_TIMING
             {
@@ -652,17 +894,22 @@ void vl53l9_app() {
                  * "Processed frame" printf above, which also goes out over the same 3Mbaud UART. */
                 static uint32_t last_profile_ms = 0;
                 uint32_t now_ms = HAL_GetTick();
-                if ((now_ms - last_profile_ms) >= 1000U) {
-                    uint32_t t_end = platform_profiler_get_timestamp();
+                uint32_t t_end = platform_profiler_get_timestamp();
+                g_rc_status.fps_x100 = (uint16_t)MIN(MAX(frame_rate * 100.0f, 0.0f), 65535.0f);
+                g_rc_status.acquire_ms = (uint16_t)(platform_profiler_convert_to_us(t_after_acquire - t_loop_start) / 1000U);
+                g_rc_status.transform_ms = (uint16_t)(platform_profiler_convert_to_us(t_after_transform - t_after_acquire) / 1000U);
+                g_rc_status.readout_ms = (uint16_t)(platform_profiler_convert_to_us(t_after_readout - t_after_transform) / 1000U);
+                g_rc_status.print_ms = (uint16_t)(platform_profiler_convert_to_us(t_before_uart - t_after_readout) / 1000U);
+                g_rc_status.uart_ms = (uint16_t)(platform_profiler_convert_to_us(t_after_uart - t_before_uart) / 1000U);
+                g_rc_status.spi_ms = (uint16_t)(platform_profiler_convert_to_us(t_end - t_after_uart) / 1000U);
+                g_rc_status.total_ms = (uint16_t)(platform_profiler_convert_to_us(t_end - t_loop_start) / 1000U);
+                if (((g_rc_status.flags & RC_FLAG_PROFILER) != 0U) && (now_ms - last_profile_ms) >= 1000U) {
                     last_profile_ms = now_ms;
                     printf("PROFILE ms: acquire=%lu transform=%lu readout=%lu print=%lu uart=%lu spi=%lu | total=%lu\n",
-                           (unsigned long)(platform_profiler_convert_to_us(t_after_acquire - t_loop_start) / 1000U),
-                           (unsigned long)(platform_profiler_convert_to_us(t_after_transform - t_after_acquire) / 1000U),
-                           (unsigned long)(platform_profiler_convert_to_us(t_after_readout - t_after_transform) / 1000U),
-                           (unsigned long)(platform_profiler_convert_to_us(t_before_uart - t_after_readout) / 1000U),
-                           (unsigned long)(platform_profiler_convert_to_us(t_after_uart - t_before_uart) / 1000U),
-                           (unsigned long)(platform_profiler_convert_to_us(t_end - t_after_uart) / 1000U),
-                           (unsigned long)(platform_profiler_convert_to_us(t_end - t_loop_start) / 1000U));
+                           (unsigned long)g_rc_status.acquire_ms, (unsigned long)g_rc_status.transform_ms,
+                           (unsigned long)g_rc_status.readout_ms, (unsigned long)g_rc_status.print_ms,
+                           (unsigned long)g_rc_status.uart_ms, (unsigned long)g_rc_status.spi_ms,
+                           (unsigned long)g_rc_status.total_ms);
                 }
             }
 #endif
@@ -757,7 +1004,7 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len, uint16_t crc) {
 }
 #endif /* CONF_STREAM_VISUALIZER || CONF_STREAM_SPI */
 
-#if CONF_STREAM_VISUALIZER
+#if CONF_STREAM_VISUALIZER || CONF_STREAM_SPI
 /**
  * @brief Send one amplitude+depth+ambient frame to the PC over the COM1 UART as a binary packet, for
  * live visualization by Utilities/vl53l9_visualizer.py. Blocking (uses HAL_UART_Transmit), so this
@@ -810,19 +1057,20 @@ static void send_vis_frame(uint32_t frame_counter, uint8_t width, uint8_t height
         handle_error();
     }
 }
-#endif /* CONF_STREAM_VISUALIZER */
+#endif /* CONF_STREAM_VISUALIZER || CONF_STREAM_SPI */
 
 #if CONF_STREAM_SPI
 /**
- * @brief Send one amplitude+depth+ambient frame to a XIAO ESP32 over SPI4, for the XIAO to re-serve as
- * a live webpage over WiFi (stm32_utility/spi/spi.ino in the separate Arduino repo). Same wire format,
- * same mixed-precision quantization and the same CRC as send_vis_frame() above (see that function's
- * comment for why depth is uint16 but amplitude/ambient stay float32) - only the transport differs.
+ * @brief Send all three images, or one runtime-selected image, to a XIAO ESP32 over SPI4 for the XIAO
+ * to re-serve as a live webpage over WiFi (stm32_utility/spi/spi.ino in the separate Arduino repo).
+ * The all-plane layout retains the same mixed-precision quantization and CRC as send_vis_frame()
+ * above (depth is uint16 while amplitude/ambient stay float32); single-plane magic identifies the
+ * shorter layouts.
  *
  * Unlike UART, SPI has no built-in framing: the transfer length must be agreed by both sides ahead of
  * the transaction, and the receiving XIAO can't produce a receive buffer on demand mid-transaction. So
- * the frame is padded out to SPI_PADDED_FRAME_BYTES and sent as SPI_CHUNK_COUNT fixed-size chunks (the
- * receiver only reads width*height pixels per plane from the header, so padding is ignored), each chunk
+ * the frame is padded to the active negotiated chunk boundary and sent as fixed-size chunks (the
+ * receiver only reads width*height pixels per plane from the header), each chunk
  * waiting on the XIAO's PIN_READY handshake before asserting the software NSS and clocking it out. If
  * the XIAO never raises READY (not powered, not flashed, not wired, or still processing) the frame is
  * abandoned mid-way rather than blocking the whole acquisition loop; the XIAO resyncs to chunk 0 on its
@@ -830,7 +1078,8 @@ static void send_vis_frame(uint32_t frame_counter, uint8_t width, uint8_t height
  */
 static void send_vis_frame_spi(uint32_t frame_counter, uint8_t width, uint8_t height, const float *amplitude,
                                 const float *depth, const float *ambient) {
-    static uint8_t tx_buf[SPI_PADDED_FRAME_BYTES];
+    static uint8_t tx_buf[SPI_MAX_PADDED_FRAME_BYTES];
+    static uint8_t rx_buf[4092U];
     static uint16_t depth_q[VIS_MAX_PLANE_PIXELS];
 
     size_t pixels = (size_t)width * height;
@@ -838,12 +1087,22 @@ static void send_vis_frame_spi(uint32_t frame_counter, uint8_t width, uint8_t he
         handle_error(); /* should never happen for a supported binning value, see VIS_MAX_PLANE_PIXELS */
     }
 
-    for (size_t i = 0; i < pixels; i++) {
-        depth_q[i] = (uint16_t)MIN(MAX(depth[i] + 0.5f, 0.0f), 65535.0f);
+    uint8_t plane_mask = g_rc_status.plane_mask;
+    if ((plane_mask & RC_PLANE_DEPTH) != 0U) {
+        for (size_t i = 0; i < pixels; i++) {
+            depth_q[i] = (uint16_t)MIN(MAX(depth[i] + 0.5f, 0.0f), 65535.0f);
+        }
     }
-
     vis_frame_header_t header;
-    memcpy(header.magic, "VL59", sizeof(header.magic));
+    if (plane_mask == RC_PLANE_AMPLITUDE) {
+        memcpy(header.magic, "VL5A", sizeof(header.magic));
+    } else if (plane_mask == RC_PLANE_DEPTH) {
+        memcpy(header.magic, "VL5D", sizeof(header.magic));
+    } else if (plane_mask == RC_PLANE_AMBIENT) {
+        memcpy(header.magic, "VL5I", sizeof(header.magic));
+    } else {
+        memcpy(header.magic, "VL59", sizeof(header.magic));
+    }
     header.frame_counter = frame_counter;
     header.width = width;
     header.height = height;
@@ -851,22 +1110,61 @@ static void send_vis_frame_spi(uint32_t frame_counter, uint8_t width, uint8_t he
     size_t amp_bytes = pixels * sizeof(float);
     size_t depth_bytes = pixels * sizeof(uint16_t);
     size_t ambient_bytes = pixels * sizeof(float);
-    size_t total = sizeof(header) + amp_bytes + depth_bytes + ambient_bytes;
+    size_t total = sizeof(header);
 
-    uint16_t crc = crc16_ccitt((const uint8_t *)amplitude, amp_bytes, 0);
-    crc = crc16_ccitt((const uint8_t *)depth_q, depth_bytes, crc);
-    crc = crc16_ccitt((const uint8_t *)ambient, ambient_bytes, crc);
+    uint16_t crc = 0U;
+    if ((plane_mask & RC_PLANE_AMPLITUDE) != 0U) {
+        crc = crc16_ccitt((const uint8_t *)amplitude, amp_bytes, crc);
+        total += amp_bytes;
+    }
+    if ((plane_mask & RC_PLANE_DEPTH) != 0U) {
+        crc = crc16_ccitt((const uint8_t *)depth_q, depth_bytes, crc);
+        total += depth_bytes;
+    }
+    if ((plane_mask & RC_PLANE_AMBIENT) != 0U) {
+        crc = crc16_ccitt((const uint8_t *)ambient, ambient_bytes, crc);
+        total += ambient_bytes;
+    }
     header.crc16 = crc;
 
-    memcpy(tx_buf, &header, sizeof(header));
-    memcpy(tx_buf + sizeof(header), amplitude, amp_bytes);
-    memcpy(tx_buf + sizeof(header) + amp_bytes, depth_q, depth_bytes);
-    memcpy(tx_buf + sizeof(header) + amp_bytes + depth_bytes, ambient, ambient_bytes);
-    /* Pad out to the full chunked length so every transaction is exactly SPI_CHUNK_BYTES - the tail
-     * beyond `total` is don't-care, the receiver sizes each plane from the header. */
-    if (total < SPI_PADDED_FRAME_BYTES) {
-        memset(tx_buf + total, 0, SPI_PADDED_FRAME_BYTES - total);
+    uint16_t chunk_bytes = g_rc_status.chunk_bytes;
+    uint16_t chunk_count = spi_chunk_count(chunk_bytes, plane_mask);
+    size_t padded_bytes = (size_t)chunk_bytes * chunk_count;
+    if (padded_bytes > sizeof(tx_buf)) {
+        g_rc_status.error = RC_ERROR_BAD_VALUE;
+        return;
     }
+
+    /* Both peers independently time out VERIFYING and return to the last stable layout. This check
+     * runs before the status trailer is built, so a still-readable link sees REVERT_AFTER_FRAME. */
+    if (g_rc_status.link_state == RC_LINK_VERIFYING && frame_counter >= g_verify_deadline_frame) {
+        g_rc_status.link_state = RC_LINK_REVERT_AFTER_FRAME;
+        g_rc_status.error = RC_ERROR_LINK_TIMEOUT;
+    }
+    bool switch_after_frame = (g_rc_status.link_state == RC_LINK_SWITCH_AFTER_FRAME);
+    bool revert_after_frame = (g_rc_status.link_state == RC_LINK_REVERT_AFTER_FRAME);
+
+    size_t offset = 0U;
+    memcpy(tx_buf + offset, &header, sizeof(header));
+    offset += sizeof(header);
+    if ((plane_mask & RC_PLANE_AMPLITUDE) != 0U) {
+        memcpy(tx_buf + offset, amplitude, amp_bytes);
+        offset += amp_bytes;
+    }
+    if ((plane_mask & RC_PLANE_DEPTH) != 0U) {
+        memcpy(tx_buf + offset, depth_q, depth_bytes);
+        offset += depth_bytes;
+    }
+    if ((plane_mask & RC_PLANE_AMBIENT) != 0U) {
+        memcpy(tx_buf + offset, ambient, ambient_bytes);
+        offset += ambient_bytes;
+    }
+    memcpy(g_rc_status.magic, RC_STATUS_MAGIC, 4U);
+    g_rc_status.version = RC_PROTOCOL_VERSION;
+    g_rc_status.frame_counter = frame_counter;
+    g_rc_status.chunk_count = chunk_count;
+    g_rc_status.crc16 = crc16_ccitt((const uint8_t *)&g_rc_status, offsetof(rc_status_t, crc16), 0U);
+    memcpy(tx_buf + total, &g_rc_status, sizeof(g_rc_status));
 
 #if SPI_TEST_PATTERN
     /* Cycle through four diagnostic patterns, switching every 5 seconds so each one spans several
@@ -889,7 +1187,7 @@ static void send_vis_frame_spi(uint32_t frame_counter, uint8_t width, uint8_t he
         case 3: fill = 0xAA; pattern_name = "all-AA"; break;
         default: break;
     }
-    for (size_t i = 0; i < SPI_PADDED_FRAME_BYTES; i++) {
+    for (size_t i = 0; i < padded_bytes; i++) {
         tx_buf[i] = (test_phase == 0U) ? (uint8_t)(i & 0xFF) : fill;
     }
 
@@ -904,7 +1202,7 @@ static void send_vis_frame_spi(uint32_t frame_counter, uint8_t width, uint8_t he
     }
 #endif
 
-    /* Send the frame as SPI_CHUNK_COUNT separate transactions. Each one re-waits for READY, because
+    /* Send the frame using the negotiated transaction count. Each one re-waits for READY, because
      * the XIAO re-arms its SPI slave between every chunk (spi_slave_queue_trans() only posts to a
      * FreeRTOS queue - the driver's task/ISR context programs the DMA and arms the peripheral some
      * tens of microseconds later, and this loop polls READY at 250MHz, so without the guard delay
@@ -912,11 +1210,10 @@ static void send_vis_frame_spi(uint32_t frame_counter, uint8_t width, uint8_t he
     HAL_StatusTypeDef status = HAL_OK;
 #if SPI_TEST_PATTERN
     /* Bisection mode: one small transaction per frame - see SPI_TEST_BYTES. */
-    const size_t chunk_bytes = SPI_TEST_BYTES;
-    const size_t chunk_count = 1;
+    chunk_bytes = SPI_TEST_BYTES;
+    chunk_count = 1;
 #else
-    const size_t chunk_bytes = SPI_CHUNK_BYTES;
-    const size_t chunk_count = SPI_CHUNK_COUNT;
+    /* Runtime values captured above. They remain fixed for every chunk in this frame. */
 #endif
 
     if (!spi_wait_ready(GPIO_PIN_SET)) {
@@ -932,8 +1229,8 @@ static void send_vis_frame_spi(uint32_t frame_counter, uint8_t width, uint8_t he
          * SCK edge arrives. */
         spi_bridge_delay_us(SPI_CS_SETUP_DELAY_US);
 
-        status = HAL_SPI_Transmit(&hspi4, tx_buf + chunk * chunk_bytes, (uint16_t)chunk_bytes,
-                                  SPI_TRANSFER_TIMEOUT_MS);
+        status = HAL_SPI_TransmitReceive(&hspi4, tx_buf + chunk * chunk_bytes, rx_buf, chunk_bytes,
+                                         SPI_TRANSFER_TIMEOUT_MS);
 
         /* CS hold: HAL_SPI_Transmit returns on EOT, but let the last bits settle at the slave before
          * releasing CS so the tail of the chunk isn't truncated by an early deassert. */
@@ -941,10 +1238,11 @@ static void send_vis_frame_spi(uint32_t frame_counter, uint8_t width, uint8_t he
         HAL_GPIO_WritePin(SPI4_NSS_GPIO_Port, SPI4_NSS_Pin, GPIO_PIN_SET); /* deselect */
 
         if (status != HAL_OK) {
-            printf("send_vis_frame_spi: HAL_SPI_Transmit failed at chunk %u/%u (status=%d)\n", (unsigned)chunk,
+            printf("send_vis_frame_spi: HAL_SPI_TransmitReceive failed at chunk %u/%u (status=%d)\n", (unsigned)chunk,
                    (unsigned)chunk_count, (int)status);
             return;
         }
+        process_runtime_command(rx_buf, chunk_bytes);
 
         /* Edge handshake before the next chunk: LOW confirms the slave saw this transaction end,
          * HIGH confirms it has re-armed. Skipped after the final chunk - the slave re-arms during
@@ -974,6 +1272,28 @@ static void send_vis_frame_spi(uint32_t frame_counter, uint8_t width, uint8_t he
         last_ok_log_ms = now;
         printf("send_vis_frame_spi: sent frame %lu OK (crc=0x%04X, %u chunks x %u bytes)\n",
                (unsigned long)frame_counter, header.crc16, (unsigned)chunk_count, (unsigned)chunk_bytes);
+    }
+
+    if (switch_after_frame) {
+        if (apply_spi_link(g_proposed_chunk_bytes, g_proposed_prescaler, g_proposed_plane_mask)) {
+            g_rc_status.link_state = RC_LINK_VERIFYING;
+            g_verify_deadline_frame = frame_counter + 10U;
+        } else {
+            g_rc_status.error = RC_ERROR_APPLY_FAILED;
+            g_rc_status.link_state = RC_LINK_STABLE;
+        }
+    } else if (revert_after_frame) {
+        if (apply_spi_link(g_stable_chunk_bytes, g_stable_prescaler, g_stable_plane_mask)) {
+            if (g_rc_status.link_rollbacks != UINT16_MAX) {
+                g_rc_status.link_rollbacks++;
+            }
+        } else {
+            g_rc_status.error = RC_ERROR_APPLY_FAILED;
+        }
+        g_rc_status.link_state = RC_LINK_STABLE;
+        g_proposed_chunk_bytes = g_stable_chunk_bytes;
+        g_proposed_prescaler = g_stable_prescaler;
+        g_proposed_plane_mask = g_stable_plane_mask;
     }
 }
 #endif /* CONF_STREAM_SPI */
